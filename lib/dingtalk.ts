@@ -11,11 +11,11 @@
 import type { DingTalkRecord, ParsedJob } from './types';
 import { ESTIMATED_MINUTES_BY_STATUS } from './types';
 
-const APP_KEY = process.env.DINGTALK_APP_KEY ?? '';
-const APP_SECRET = process.env.DINGTALK_APP_SECRET ?? '';
-const DEFAULT_BASE_ID = process.env.DINGTALK_BASE_ID ?? '';
-const DEFAULT_SHEET_ID = process.env.DINGTALK_TABLE_ID || DEFAULT_BASE_ID || '';
-const OPERATOR_ID = process.env.DINGTALK_OPERATOR_ID ?? '';
+const APP_KEY = process.env.DEMO_DINGTALK_APP_KEY ?? '';
+const APP_SECRET = process.env.DEMO_DINGTALK_APP_SECRET ?? '';
+const DEFAULT_BASE_ID = process.env.DEMO_DINGTALK_BASE_ID ?? '';
+const DEFAULT_SHEET_ID = process.env.DEMO_DINGTALK_TABLE_ID || DEFAULT_BASE_ID || '';
+const OPERATOR_ID = process.env.DEMO_DINGTALK_OPERATOR_ID ?? '';
 
 const API_BASE = 'https://api.dingtalk.com';
 
@@ -44,7 +44,7 @@ export interface WorkspaceConfig {
 function resolveIds(config?: WorkspaceConfig): { baseId: string; sheetId: string | undefined } {
   if (config?.demoMode) {
     const baseId = DEFAULT_BASE_ID;
-    if (!baseId) throw new Error('演示模式缺少 DINGTALK_BASE_ID 环境变量');
+    if (!baseId) throw new Error('演示模式缺少 DEMO_DINGTALK_BASE_ID 环境变量');
     return { baseId, sheetId: DEFAULT_SHEET_ID || undefined };
   }
   const baseId = config?.baseId?.trim();
@@ -114,7 +114,7 @@ async function resolveSheetId(
     return sheetId;
   }
 
-  // Case 2: 默认 base, 使用默认 sheetId (来自环境变量 DINGTALK_TABLE_ID)
+  // Case 2: 默认 base, 使用默认 sheetId (来自环境变量 DEMO_DINGTALK_TABLE_ID)
   if (baseId === DEFAULT_BASE_ID && DEFAULT_SHEET_ID) {
     return DEFAULT_SHEET_ID;
   }
@@ -155,7 +155,7 @@ async function getAccessToken(config?: WorkspaceConfig): Promise<string> {
       return tokenCache.token;
     }
     if (!APP_KEY || !APP_SECRET) {
-      throw new Error('演示模式缺少 DINGTALK_APP_KEY / DINGTALK_APP_SECRET 环境变量');
+      throw new Error('演示模式缺少 DEMO_DINGTALK_APP_KEY / DEMO_DINGTALK_APP_SECRET 环境变量');
     }
     const url = `https://oapi.dingtalk.com/gettoken?appkey=${encodeURIComponent(APP_KEY)}&appsecret=${encodeURIComponent(APP_SECRET)}`;
     const res = await fetch(url, { method: 'GET' });
@@ -806,81 +806,6 @@ function preFilter(
   }
 
   return candidates;
-}
-
-async function aiJudgeMatch(
-  newMatchKey: string,
-  candidates: DingTalkRecord[]
-): Promise<DingTalkRecord | null> {
-  const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY ?? '';
-  const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL ?? 'deepseek-chat';
-  const DEEPSEEK_BASE_URL =
-    process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com';
-
-  if (!DEEPSEEK_API_KEY) {
-    return simpleFuzzyMatch(newMatchKey, candidates);
-  }
-
-  const candidateList = candidates.map((r, i) => {
-    const f = r.fields as Record<string, unknown>;
-    return `${i + 1}. 公司: ${f['公司'] ?? ''}, 岗位: ${f['岗位'] ?? ''}, recordId: ${r.recordId}`;
-  });
-
-  const prompt = `你是一个招聘数据匹配助手。请判断下面的新招聘记录与已有记录列表中的哪一条最可能是同一个岗位。
-
-新记录的 match_key: "${newMatchKey}"
-
-已有记录列表:
-${candidateList.join('\n')}
-
-请直接返回匹配到的记录编号 (1, 2, 3, ...) 或 "无匹配"。
-只返回数字或 "无匹配", 不要返回其他内容。`;
-
-  try {
-    const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0,
-        max_tokens: 50,
-      }),
-    });
-
-    if (!res.ok) {
-      console.warn('[AI匹配] API 调用失败, 回退到简单匹配');
-      return simpleFuzzyMatch(newMatchKey, candidates);
-    }
-
-    const data = (await res.json()) as {
-      choices: Array<{ message: { content: string } }>;
-    };
-    const answer = data.choices?.[0]?.message?.content?.trim() ?? '';
-    console.log(`[AI匹配] AI 判断结果: "${answer}"`);
-
-    if (answer.includes('无匹配')) {
-      return null;
-    }
-
-    const numMatch = answer.match(/\d+/);
-    if (!numMatch) {
-      return simpleFuzzyMatch(newMatchKey, candidates);
-    }
-
-    const index = parseInt(numMatch[0], 10) - 1;
-    if (index >= 0 && index < candidates.length) {
-      return candidates[index];
-    }
-
-    return null;
-  } catch (err) {
-    console.warn('[AI匹配] 调用异常, 回退到简单匹配:', err);
-    return simpleFuzzyMatch(newMatchKey, candidates);
-  }
 }
 
 // ============== 字段值规范化 ==============

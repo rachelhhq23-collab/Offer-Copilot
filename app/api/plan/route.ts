@@ -48,7 +48,7 @@ export async function POST(request: Request) {
     }
 
     // 演示模式优先使用环境变量; 否则使用调用方传入的 deepseekKey; 两者都没有则报错
-    const resolvedDeepseekKey = isDemo ? process.env.DEEPSEEK_API_KEY : body.deepseekKey;
+    const resolvedDeepseekKey = isDemo ? process.env.DEMO_DEEPSEEK_API_KEY : body.deepseekKey;
     if (!resolvedDeepseekKey) {
       return NextResponse.json({ success: false, error: '缺少 DeepSeek API Key' }, { status: 500 });
     }

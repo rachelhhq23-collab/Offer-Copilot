@@ -17,12 +17,12 @@ import { ESTIMATED_MINUTES_BY_STATUS } from './types';
 
 // ============== 环境变量 (仅演示模式使用) ==============
 
-const ENV_DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY ?? '';
+const ENV_DEEPSEEK_API_KEY = process.env.DEMO_DEEPSEEK_API_KEY ?? '';
 const ENV_DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL ?? 'deepseek-chat';
 const ENV_DEEPSEEK_BASE_URL =
   process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com';
 
-const ENV_QWEN_API_KEY = process.env.QWEN_API_KEY ?? '';
+const ENV_QWEN_API_KEY = process.env.DEMO_QWEN_API_KEY ?? '';
 const ENV_QWEN_MODEL = process.env.QWEN_MODEL ?? 'qwen-vl-flash';
 const ENV_QWEN_BASE_URL =
   process.env.QWEN_BASE_URL ??
