@@ -298,6 +298,14 @@ export async function fetchAllRecords(config?: WorkspaceConfig): Promise<DingTal
 // ============== 字段构建 ==============
 
 /**
+ * 钉钉表格附件字段只接受图片 URL (http/https), 不接受 base64 或其他文本
+ */
+function isStorableImageUrl(value: string): boolean {
+  const v = value.trim();
+  return /^https?:\/\//i.test(v);
+}
+
+/**
  * 根据 ParsedJob 构建钉钉表格字段
  * 严格对齐 16 个字段, null 值字段不写入
  */
@@ -390,7 +398,8 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   }
 
   // ---- 原始输入图片 ----
-  if (parsed.raw_image && parsed.raw_image.trim() !== '') {
+  // 钉钉表格的图片字段是附件类型, 只接受图片 URL, 不接受 base64/文本
+  if (parsed.raw_image && isStorableImageUrl(parsed.raw_image)) {
     fields['原始输入图片'] = parsed.raw_image.trim();
   }
 
@@ -616,8 +625,8 @@ export async function updateRecord(
     }
   }
 
-  // 追加原始输入图片
-  if (existingRecord && parsed.raw_image) {
+  // 追加原始输入图片 (同样只追加可存储的图片 URL)
+  if (existingRecord && parsed.raw_image && isStorableImageUrl(parsed.raw_image)) {
     const existingRaw = String(existingRecord.fields['原始输入图片'] ?? '');
     const newEntry = formatRawTextEntry(parsed.raw_image);
     if (existingRaw) {
@@ -893,7 +902,7 @@ export async function deleteRecord(recordId: string, config?: WorkspaceConfig): 
   const { baseId, sheetId } = resolveIds(config);
   const finalSheetId = await resolveSheetId(token, baseId, sheetId, operatorId);
 
-  const url = `${API_BASE}/v1.0/notable/bases/${baseId}/sheets/${finalSheetId}/records/batchDelete?operatorId=${encodeURIComponent(operatorId)}`;
+  const url = `${API_BASE}/v1.0/notable/bases/${baseId}/sheets/${finalSheetId}/records/delete?operatorId=${encodeURIComponent(operatorId)}`;
   console.log(`[钉钉] 删除记录: ${url}, recordId=${recordId}`);
 
   const res = await fetch(url, {
@@ -902,7 +911,7 @@ export async function deleteRecord(recordId: string, config?: WorkspaceConfig): 
       'x-acs-dingtalk-access-token': token,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ ids: [recordId] }),
+    body: JSON.stringify({ recordIds: [recordId] }),
   });
 
   if (!res.ok) {

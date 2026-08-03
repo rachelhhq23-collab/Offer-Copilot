@@ -213,6 +213,8 @@ export interface BatchSubmitRequest {
   batch_result: BatchParsedResult;
   /** 信息来源渠道 */
   source_channel?: string;
+  /** 原始输入图片 (base64, 可选) */
+  image?: string;
   /** 工作空间配置 */
   workspace?: { baseId: string; sheetId?: string };
 }

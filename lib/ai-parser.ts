@@ -23,7 +23,7 @@ const ENV_DEEPSEEK_BASE_URL =
   process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com';
 
 const ENV_QWEN_API_KEY = process.env.DEMO_QWEN_API_KEY ?? '';
-const ENV_QWEN_MODEL = process.env.QWEN_MODEL ?? 'qwen-vl-flash';
+const ENV_QWEN_MODEL = process.env.QWEN_MODEL ?? 'qwen-vl-plus';
 const ENV_QWEN_BASE_URL =
   process.env.QWEN_BASE_URL ??
   'https://dashscope.aliyuncs.com/compatible-mode/v1';
@@ -36,7 +36,7 @@ export interface AIConfig {
 }
 
 const TEXT_TIMEOUT = 15000;
-const IMAGE_TIMEOUT = 20000;
+const IMAGE_TIMEOUT = 60000;
 
 // ============== System Prompt ==============
 
@@ -197,12 +197,12 @@ function parseJsonFromAi(
   try {
     parsed = JSON.parse(jsonStr);
   } catch {
-    const match = textContent.match(/\{[\s\S]*\}/);
-    if (!match) {
-      console.error('[AI] 无法从返回内容中提取 JSON:', textContent.slice(0, 500));
+    const extracted = extractJsonObject(textContent);
+    if (!extracted) {
+      console.error('[AI] 无法从返回内容中提取 JSON:', textContent.slice(0, 2000));
       throw new Error('AI 返回内容格式异常, 无法解析');
     }
-    parsed = JSON.parse(match[0]);
+    parsed = JSON.parse(extracted);
   }
 
   const messageType: MessageType = parsed.message_type ?? 'single';
@@ -292,6 +292,37 @@ function parseJsonFromAi(
     };
     return { message_type: 'single', data };
   }
+}
+
+/**
+ * 从模型输出中提取第一个可解析的 JSON 对象
+ * 模型偶尔会在 JSON 前后附加解释文字, 这里按括号配对提取
+ */
+function extractJsonObject(text: string): string | null {
+  let start = text.indexOf('{');
+  while (start !== -1) {
+    let depth = 0;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '{') {
+        depth += 1;
+      } else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          const candidate = text.slice(start, i + 1);
+          try {
+            JSON.parse(candidate);
+            return candidate;
+          } catch {
+            // 括号配对但内容非法, 继续找下一个对象
+            break;
+          }
+        }
+      }
+    }
+    start = text.indexOf('{', start + 1);
+  }
+  return null;
 }
 
 /**
@@ -409,56 +440,74 @@ async function parseImageWithQwen(
   const url = `${baseUrl}/chat/completions`;
   const imageData = normalizeImageData(imageBase64);
 
-  const res = await fetchWithTimeout(
-    url,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
+  const runOnce = async (strict: boolean) => {
+    const text = strict
+      ? '请识别这张图片中的招聘通知信息。必须只输出一个 JSON 对象, 不要输出 markdown 代码块, 不要任何解释文字。'
+      : '请识别这张图片中的招聘通知信息, 按照要求返回 JSON';
+
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: buildSystemPrompt() },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: { url: imageData },
+                },
+                {
+                  type: 'text',
+                  text,
+                },
+              ],
+            },
+          ],
+          temperature: 0.1,
+          max_tokens: 2048,
+          response_format: { type: 'json_object' },
+        }),
       },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: buildSystemPrompt() },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: { url: imageData },
-              },
-              {
-                type: 'text',
-                text: '请识别这张图片中的招聘通知信息, 按照要求返回 JSON',
-              },
-            ],
-          },
-        ],
-        temperature: 0.1,
-        max_tokens: 2048,
-        response_format: { type: 'json_object' },
-      }),
-    },
-    IMAGE_TIMEOUT
-  );
+      IMAGE_TIMEOUT
+    );
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error('[千问] API 错误:', res.status, errText);
-    throw new Error(`千问视觉解析失败: HTTP ${res.status} - ${errText}`);
-  }
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('[千问] API 错误:', res.status, errText);
+      throw new Error(`千问视觉解析失败: HTTP ${res.status} - ${errText}`);
+    }
 
-  const data = (await res.json()) as {
-    choices: Array<{ message: { content: string } }>;
+    const data = (await res.json()) as {
+      choices: Array<{ message: { content: string } }>;
+    };
+
+    const textContent = data.choices?.[0]?.message?.content ?? '';
+    if (!textContent) {
+      throw new Error('千问返回内容为空');
+    }
+
+    return parseJsonFromAi(textContent);
   };
 
-  const textContent = data.choices?.[0]?.message?.content ?? '';
-  if (!textContent) {
-    throw new Error('千问返回内容为空');
+  try {
+    return await runOnce(false);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // 仅在内容格式异常时重试, HTTP/网络错误直接抛出
+    if (!message.includes('格式异常') && !message.includes('返回内容为空')) {
+      throw err;
+    }
+    console.warn('[千问] 首次返回格式异常, 以 strict 模式重试:', message);
+    return await runOnce(true);
   }
-
-  return parseJsonFromAi(textContent);
 }
 
 // ============== 对外主入口 ==============

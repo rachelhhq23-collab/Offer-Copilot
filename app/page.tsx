@@ -538,30 +538,35 @@ function AIConfigSection({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [deepseekKey, setDeepseekKey] = useState(aiKeys?.deepseekKey ?? '');
+  const [qwenKey, setQwenKey] = useState(aiKeys?.qwenKey ?? '');
   const [showDeepseek, setShowDeepseek] = useState(false);
+  const [showQwen, setShowQwen] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     setDeepseekKey(aiKeys?.deepseekKey ?? '');
+    setQwenKey(aiKeys?.qwenKey ?? '');
   }, [aiKeys]);
 
-  const hasSaved = !!aiKeys?.deepseekKey;
+  const hasSaved = !!(aiKeys?.deepseekKey || aiKeys?.qwenKey);
 
   const handleSave = () => {
     const dk = deepseekKey.trim();
-    if (!dk) {
+    const qk = qwenKey.trim();
+    if (!dk && !qk) {
       onSave(null);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       return;
     }
-    onSave({ deepseekKey: dk });
+    onSave({ deepseekKey: dk, qwenKey: qk });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
 
   const handleClear = () => {
     setDeepseekKey('');
+    setQwenKey('');
     onSave(null);
   };
 
@@ -588,7 +593,7 @@ function AIConfigSection({
         <div className="dev-config-body">
           <div className="dev-config-notice">
             <Info size={13} />
-            <span>用于解析你粘贴的招聘信息。密钥仅存储在当前浏览器。</span>
+            <span>文字信息用 DeepSeek 解析，海报/截图用图像模型（Qwen-VL）识别。密钥仅存储在当前浏览器。</span>
           </div>
 
           <div className="dev-config-fields">
@@ -622,6 +627,40 @@ function AIConfigSection({
                 前往 platform.deepseek.com 获取 →
               </a>
             </div>
+
+            <div className="dev-config-field">
+              <label className="dev-config-label">
+                图像模型 API Key（Qwen-VL）
+                <button
+                  type="button"
+                  className="dev-config-toggle"
+                  onClick={() => setShowQwen((v) => !v)}
+                >
+                  {showQwen ? <EyeOff size={13} /> : <Eye size={13} />}
+                  {showQwen ? '隐藏' : '显示'}
+                </button>
+              </label>
+              <input
+                type={showQwen ? 'text' : 'password'}
+                className="dev-config-input"
+                value={qwenKey}
+                onChange={(e) => setQwenKey(e.target.value)}
+                placeholder="sk-..."
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <a
+                className="dev-config-helper-link"
+                href="https://bailian.console.aliyun.com/?apiKey=1#/api-key"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                前往阿里云百炼获取 →
+              </a>
+              <p className="dev-config-desc">
+                用于识别招聘海报/截图。未填写时仅支持文字解析。
+              </p>
+            </div>
           </div>
 
           <div className="dev-config-actions">
@@ -631,10 +670,10 @@ function AIConfigSection({
                 已启用本地密钥
               </span>
             )}
-            <button className="btn btn-secondary" onClick={handleClear} disabled={!hasSaved && !deepseekKey}>
+            <button className="btn btn-secondary" onClick={handleClear} disabled={!hasSaved && !deepseekKey && !qwenKey}>
               清除
             </button>
-            <button className="btn btn-primary" onClick={handleSave} disabled={!deepseekKey.trim()}>
+            <button className="btn btn-primary" onClick={handleSave} disabled={!deepseekKey.trim() && !qwenKey.trim()}>
               {saved ? '已保存' : '保存'}
             </button>
           </div>
@@ -683,7 +722,9 @@ function SetupWizard({
 
   // 步骤 1: AI 模型
   const [deepseekKey, setDeepseekKey] = useState(aiKeys?.deepseekKey ?? '');
+  const [qwenKey, setQwenKey] = useState(aiKeys?.qwenKey ?? '');
   const [showDeepseek, setShowDeepseek] = useState(false);
+  const [showQwen, setShowQwen] = useState(false);
 
   // 步骤 2: 钉钉应用
   const [appKey, setAppKey] = useState(credentials?.appKey ?? '');
@@ -695,14 +736,14 @@ function SetupWizard({
   const [wsName, setWsName] = useState(workspaces[0]?.name ?? '');
   const [baseId, setBaseId] = useState(workspaces[0]?.baseId ?? '');
 
-  const step1Valid = !!deepseekKey.trim();
+  const step1Valid = !!deepseekKey.trim() || !!qwenKey.trim();
   const step2Valid = !!appKey.trim() && !!appSecret.trim() && !!operatorId.trim();
   const step3Valid = !!wsName.trim() && !!baseId.trim();
 
   const handleNext = () => {
     if (step === 0) {
       if (!step1Valid) return;
-      onSaveAIKeys({ deepseekKey: deepseekKey.trim() });
+      onSaveAIKeys({ deepseekKey: deepseekKey.trim(), qwenKey: qwenKey.trim() });
       setStep(1);
     } else if (step === 1) {
       if (!step2Valid) return;
@@ -764,7 +805,7 @@ function SetupWizard({
             <div className="wizard-step-pane">
               <div className="wizard-step-header">
                 <h2 className="wizard-step-title">配置 AI 模型</h2>
-                <p className="wizard-step-desc">我们需要用 AI 模型来读懂你粘贴的招聘信息,请填入你自己的 API 密钥。</p>
+                <p className="wizard-step-desc">文字用 DeepSeek 解析，海报/截图用 Qwen-VL 图像模型识别，请填入对应的 API 密钥。</p>
               </div>
 
               <div className="wizard-fields">
@@ -795,6 +836,36 @@ function SetupWizard({
                     rel="noopener noreferrer"
                   >
                     前往 platform.deepseek.com 获取 →
+                  </a>
+                </div>
+
+                <div className="wizard-field">
+                  <label className="wizard-label">图像模型 API Key（Qwen-VL）</label>
+                  <div className="wizard-input-wrap">
+                    <input
+                      type={showQwen ? 'text' : 'password'}
+                      className="wizard-input"
+                      value={qwenKey}
+                      onChange={(e) => setQwenKey(e.target.value)}
+                      placeholder="sk-..."
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      className="wizard-input-toggle"
+                      onClick={() => setShowQwen((v) => !v)}
+                    >
+                      {showQwen ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                  <a
+                    className="wizard-helper-link"
+                    href="https://bailian.console.aliyun.com/?apiKey=1#/api-key"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    前往阿里云百炼获取 →
                   </a>
                 </div>
               </div>
@@ -1031,18 +1102,50 @@ export default function HomePage() {
 
   // ===== 提交相关函数 =====
 
-  const handleImageFile = (_file: File) => {
-    showToast('图片识别功能即将上线，目前请先粘贴文字内容');
+  const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
+
+  const fileToDataUrl = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error('图片读取失败, 请重试'));
+      reader.readAsDataURL(file);
+    });
+
+  const handleImageFile = async (file: File | null | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('请选择图片文件');
+      return;
+    }
+    if (file.size > MAX_IMAGE_SIZE) {
+      showToast('图片不能超过 8MB');
+      return;
+    }
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      setImageBase64(dataUrl);
+      setImagePreview(dataUrl);
+      setImageName(file.name || '招聘截图');
+      setResult(null);
+      setBatchResult(null);
+      setSelectedIndices([]);
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '图片读取失败, 请重试');
+    }
   };
 
-  const handleFileChange = (_e: ChangeEvent<HTMLInputElement>) => {
-    showToast('图片识别功能即将上线，目前请先粘贴文字内容');
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    void handleImageFile(file);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragOver(false);
-    showToast('图片识别功能即将上线，目前请先粘贴文字内容');
+    void handleImageFile(e.dataTransfer.files?.[0]);
   };
 
   const handlePaste = (e: React.ClipboardEvent) => {
@@ -1051,7 +1154,7 @@ export default function HomePage() {
     for (const item of items) {
       if (item.type.startsWith('image/')) {
         e.preventDefault();
-        showToast('图片识别功能即将上线，目前请先粘贴文字内容');
+        void handleImageFile(item.getAsFile());
         return;
       }
     }
@@ -1064,8 +1167,8 @@ export default function HomePage() {
   };
 
   const handleSubmit = async () => {
-    if (!content.trim()) {
-      setError('请输入文字内容');
+    if (!content.trim() && !imageBase64) {
+      setError('请输入文字内容或上传图片');
       return;
     }
 
@@ -1077,8 +1180,12 @@ export default function HomePage() {
     setSelectedIndices([]);
 
     try {
-      const body: { content?: string; source_channel?: string; workspace?: { baseId?: string; sheetId?: string; appKey?: string; appSecret?: string; operatorId?: string; demoMode?: boolean }; deepseekKey?: string; qwenKey?: string; demoMode?: boolean } = {};
+      const body: { content?: string; image?: string; inputType?: 'text' | 'image'; source_channel?: string; workspace?: { baseId?: string; sheetId?: string; appKey?: string; appSecret?: string; operatorId?: string; demoMode?: boolean }; deepseekKey?: string; qwenKey?: string; demoMode?: boolean } = {};
       if (content.trim()) body.content = content.trim();
+      if (imageBase64) {
+        body.image = imageBase64;
+        body.inputType = 'image';
+      }
       // 信息来源可选, 默认"其他"
       body.source_channel = sourceChannel || '其他';
       if (wsConfig) body.workspace = wsConfig;
@@ -1123,6 +1230,7 @@ export default function HomePage() {
           batch_result: result.batch_result,
           source_channel: sourceChannel || '其他',
           content: content,
+          ...(imageBase64 ? { image: imageBase64 } : {}),
           ...(wsConfig ? { workspace: wsConfig } : {}),
           ...(demoMode ? { demoMode: true } : {}),
         }),
@@ -1277,7 +1385,7 @@ export default function HomePage() {
     return r.company.toLowerCase().includes(q) || r.position.toLowerCase().includes(q);
   });
 
-  const hasInput = content.trim();
+  const hasInput = !!content.trim() || !!imageBase64;
   const isBatch = result?.message_type === 'batch';
   const isSingle = result?.message_type === 'single' || (result?.success && !isBatch);
 
@@ -1392,11 +1500,11 @@ export default function HomePage() {
                   }}
                   onDragLeave={() => setDragOver(false)}
                   onDrop={handleDrop}
-                  onClick={() => showToast('图片识别功能即将上线，目前请先粘贴文字内容')}
+                  onClick={() => fileInputRef.current?.click()}
                 >
                   <div className="upload-content">
                     <Upload className="upload-icon" size={24} />
-                    <div className="upload-text">上传招聘截图</div>
+                    <div className="upload-text">{imagePreview ? '点击重新选择截图' : '上传招聘截图'}</div>
                     <div className="upload-hint">支持PNG、JPG,截图中的岗位信息会被自动识别</div>
                   </div>
                   <input
@@ -1407,6 +1515,24 @@ export default function HomePage() {
                     onChange={handleFileChange}
                   />
                 </div>
+
+                {imagePreview && (
+                  <div className="image-preview-card">
+                    <img src={imagePreview} alt="招聘截图预览" className="image-preview-img" />
+                    <div className="image-preview-info">
+                      <span className="image-preview-name">{imageName}</span>
+                      <span className="image-preview-meta">将使用千问视觉模型识别</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="image-preview-remove"
+                      onClick={removeImage}
+                    >
+                      <X size={14} />
+                      移除
+                    </button>
+                  </div>
+                )}
 
                 <div className="source-section">
                   <div className="source-label">

@@ -31,6 +31,7 @@ export async function POST(request: Request) {
     const body = (await request.json()) as BatchSubmitRequest & { content?: string; demoMode?: boolean };
     const { selected_indices, batch_result } = body;
     const rawContent = body.content ?? '';
+    const rawImage = body.image ?? '';
     const wsRaw = body.workspace as { baseId?: string; sheetId?: string; appKey?: string; appSecret?: string; operatorId?: string; demoMode?: boolean } | undefined;
     const isDemo = body.demoMode === true || wsRaw?.demoMode === true;
     const workspace: WorkspaceConfig | undefined = isDemo
@@ -94,7 +95,7 @@ export async function POST(request: Request) {
         priority: '中',
         source_channel: body.source_channel ?? null,
         raw_text: rawContent || null,
-        raw_image: null,
+        raw_image: rawImage || null,
       };
 
       // ---- 校验 ----
