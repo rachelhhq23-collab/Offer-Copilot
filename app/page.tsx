@@ -1103,6 +1103,8 @@ export default function HomePage() {
   // ===== 提交相关函数 =====
 
   const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
+  const MAX_COMPRESSED_SIZE = 4 * 1024 * 1024;
+  const MAX_IMAGE_DIMENSION = 2048;
 
   const fileToDataUrl = (file: File): Promise<string> =>
     new Promise((resolve, reject) => {
@@ -1111,6 +1113,35 @@ export default function HomePage() {
       reader.onerror = () => reject(new Error('图片读取失败, 请重试'));
       reader.readAsDataURL(file);
     });
+
+  const compressImage = async (file: File): Promise<string> => {
+    const dataUrl = await fileToDataUrl(file);
+    const img = new Image();
+    img.src = dataUrl;
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('图片加载失败'));
+    });
+
+    let { width, height } = img;
+    const ratio = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(width, height));
+    width = Math.round(width * ratio);
+    height = Math.round(height * ratio);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0, width, height);
+
+    let quality = 0.9;
+    let result = canvas.toDataURL('image/jpeg', quality);
+    while (result.length > MAX_COMPRESSED_SIZE && quality > 0.3) {
+      quality -= 0.1;
+      result = canvas.toDataURL('image/jpeg', quality);
+    }
+    return result;
+  };
 
   const handleImageFile = async (file: File | null | undefined) => {
     if (!file) return;
@@ -1123,7 +1154,13 @@ export default function HomePage() {
       return;
     }
     try {
-      const dataUrl = await fileToDataUrl(file);
+      let dataUrl: string;
+      if (file.size > MAX_COMPRESSED_SIZE) {
+        showToast('图片较大, 自动压缩中...');
+        dataUrl = await compressImage(file);
+      } else {
+        dataUrl = await fileToDataUrl(file);
+      }
       setImageBase64(dataUrl);
       setImagePreview(dataUrl);
       setImageName(file.name || '招聘截图');

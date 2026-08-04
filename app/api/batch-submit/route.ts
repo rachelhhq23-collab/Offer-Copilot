@@ -26,6 +26,14 @@ import type {
 
 export const runtime = 'nodejs';
 
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+  },
+};
+
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as BatchSubmitRequest & { content?: string; demoMode?: boolean };
