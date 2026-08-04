@@ -417,6 +417,60 @@ async function parseTextWithDeepseek(
 
 // ============== 图片解析 (千问) ==============
 
+const VISION_PROMPT = `请识别这张图片中的所有文字内容, 然后提取招聘相关信息, 严格按以下 JSON 格式输出。
+
+当前日期: ${new Date().getFullYear()}年${new Date().getMonth() + 1}月${new Date().getDate()}日
+
+提取规则:
+- company: 公司名称 (必填, 从图片中找)
+- position: 岗位名称 (必填, 从图片中找所有岗位)
+- city: 城市数组, 只能选: 北京/上海/深圳/广州/杭州/成都/海外/其他/未知
+- deadline: 截止日期, 格式 YYYY-MM-DD, 没有填 null
+- referral_code: 内推码, 没有填 null
+- source_url: 报名链接, 没有填 null
+- requirements: 学历/专业/面向对象等要求, 没有填 null
+- status_hint: 状态, 默认"待投递"
+- priority: 优先级 高/中/低/暂缓
+
+判断 single vs batch:
+- 图片中有 2 个或以上不同岗位 → message_type = "batch", 每个岗位放在 candidates 数组
+- 只有 1 个岗位 → message_type = "single"
+
+=== single 格式 ===
+{
+  "message_type": "single",
+  "company": "公司名",
+  "position": "岗位名",
+  "city": ["城市"],
+  "deadline": "2026-08-15",
+  "referral_code": "内推码或null",
+  "source_url": "链接或null",
+  "requirements": "要求或null",
+  "description": null,
+  "status_hint": "待投递",
+  "priority": "中",
+  "match_key": "公司-岗位"
+}
+
+=== batch 格式 ===
+{
+  "message_type": "batch",
+  "source_company": "公司名",
+  "shared_fields": {
+    "deadline": "2026-08-15",
+    "referral_code": "内推码或null",
+    "source_link": "链接或null",
+    "city": ["城市"],
+    "requirements": "共享要求或null"
+  },
+  "candidates": [
+    {"position": "岗位1", "description": null, "requirements": null},
+    {"position": "岗位2", "description": null, "requirements": null}
+  ]
+}
+
+只输出 JSON, 不要任何解释文字。`;
+
 function normalizeImageData(image: string): string {
   if (image.startsWith('data:')) {
     return image;
@@ -441,9 +495,13 @@ async function parseImageWithQwen(
   const imageData = normalizeImageData(imageBase64);
 
   const runOnce = async (strict: boolean) => {
-    const text = strict
-      ? '请识别这张图片中的招聘通知信息。必须只输出一个 JSON 对象, 不要输出 markdown 代码块, 不要任何解释文字。'
-      : '请识别这张图片中的招聘通知信息, 按照要求返回 JSON';
+    const systemPrompt = strict
+      ? '你是一个严谨的招聘信息提取器。识别图片中的文字, 严格按照用户要求的 JSON 格式输出。只输出 JSON 对象, 不要任何多余内容。'
+      : VISION_PROMPT;
+
+    const userText = strict
+      ? '识别这张图片, 提取所有招聘信息, 输出 JSON'
+      : '识别这张图片中的招聘信息';
 
     const res = await fetchWithTimeout(
       url,
@@ -456,7 +514,7 @@ async function parseImageWithQwen(
         body: JSON.stringify({
           model,
           messages: [
-            { role: 'system', content: buildSystemPrompt() },
+            { role: 'system', content: systemPrompt },
             {
               role: 'user',
               content: [
@@ -466,14 +524,13 @@ async function parseImageWithQwen(
                 },
                 {
                   type: 'text',
-                  text,
+                  text: userText,
                 },
               ],
             },
           ],
           temperature: 0.1,
-          max_tokens: 2048,
-          response_format: { type: 'json_object' },
+          max_tokens: 4096,
         }),
       },
       IMAGE_TIMEOUT
@@ -494,6 +551,8 @@ async function parseImageWithQwen(
       throw new Error('千问返回内容为空');
     }
 
+    console.log('[千问] 原始返回:', textContent.slice(0, 500));
+
     return parseJsonFromAi(textContent);
   };
 
@@ -501,7 +560,6 @@ async function parseImageWithQwen(
     return await runOnce(false);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // 仅在内容格式异常时重试, HTTP/网络错误直接抛出
     if (!message.includes('格式异常') && !message.includes('返回内容为空')) {
       throw err;
     }

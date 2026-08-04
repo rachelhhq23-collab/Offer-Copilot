@@ -1080,9 +1080,9 @@ export default function HomePage() {
     }
   }, [toastMsg]);
 
-  // 切换 Tab 或工作空间时加载历史
+  // 切换 Tab 或工作空间时加载历史 (每次切到机会/计划页都刷新, 确保看到最新数据)
   useEffect(() => {
-    if ((activeTab === 'history' || activeTab === 'plan') && historyRecords.length === 0) {
+    if (activeTab === 'history' || activeTab === 'plan') {
       loadHistory();
     }
   }, [activeTab, activeId]);
@@ -1167,6 +1167,7 @@ export default function HomePage() {
   };
 
   const handleSubmit = async () => {
+    if (loading) return; // 防重复提交
     if (!content.trim() && !imageBase64) {
       setError('请输入文字内容或上传图片');
       return;
@@ -1202,7 +1203,10 @@ export default function HomePage() {
       const data = (await res.json()) as ParseResult;
       setResult(data);
 
-      if (!res.ok || !data.success) {
+      if (res.ok && data.success) {
+        // 提交成功后刷新历史记录, 确保切到机会页能看到最新数据
+        loadHistory();
+      } else {
         setError(data.error ?? data.message ?? '提交失败');
       }
     } catch (err) {
@@ -1213,6 +1217,7 @@ export default function HomePage() {
   };
 
   const handleBatchConfirm = async () => {
+    if (batchSubmitting) return; // 防重复提交
     if (!result?.batch_result || selectedIndices.length === 0) {
       setError('请至少选择一个岗位');
       return;
@@ -1239,7 +1244,9 @@ export default function HomePage() {
       const data = (await res.json()) as BatchSubmitResponse;
       setBatchResult(data);
 
-      if (!res.ok || !data.success) {
+      if (res.ok && data.success) {
+        loadHistory();
+      } else {
         setError(data.error ?? data.message ?? '批量提交失败');
       }
     } catch (err) {
@@ -1286,6 +1293,7 @@ export default function HomePage() {
     try {
       const res = await fetch('/api/history', {
         headers: workspaceHeader,
+        cache: 'no-store',
       });
       const data = await res.json();
       if (data.success) {
@@ -1684,6 +1692,7 @@ export default function HomePage() {
                     record={rec}
                     onDelete={() => handleDeleteRecord(rec.recordId)}
                     hideDelete={demoMode}
+                    workspaceHeader={workspaceHeader}
                   />
                 ))}
               </div>
@@ -2181,11 +2190,54 @@ function parseRawTextSegments(rawText: string): Array<{ timestamp: string | null
   return segments.reverse();
 }
 
-function HistoryCard({ record, onDelete, hideDelete }: { record: HistoryRecordItem; onDelete: () => void; hideDelete?: boolean }) {
+function HistoryCard({ record, onDelete, hideDelete, workspaceHeader }: { record: HistoryRecordItem; onDelete: () => void; hideDelete?: boolean; workspaceHeader: Record<string, string> }) {
   const [expanded, setExpanded] = useState(false);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [imageError, setImageError] = useState(false);
+  const [localRawText, setLocalRawText] = useState(record.raw_text);
+  const [confirmDeleteIdx, setConfirmDeleteIdx] = useState<number | null>(null);
+  const [deletingIdx, setDeletingIdx] = useState<number | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const ddlStatus = deadlineStatus(record.deadline, record.status);
 
-  const rawTextSegments = record.raw_text ? parseRawTextSegments(record.raw_text) : [];
+  const rawTextSegments = localRawText ? parseRawTextSegments(localRawText) : [];
+  const hasImage = !!record.raw_image;
+
+  // 同步外部 record.raw_text 变化 (如刷新数据后)
+  useEffect(() => {
+    setLocalRawText(record.raw_text);
+  }, [record.raw_text]);
+
+  const handleDeleteSegment = async (idx: number) => {
+    const seg = rawTextSegments[idx];
+    if (!seg) return;
+    setDeletingIdx(idx);
+    setDeleteError(null);
+    try {
+      const res = await fetch('/api/history/raw-text', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', ...workspaceHeader },
+        body: JSON.stringify({
+          recordId: record.recordId,
+          timestamp: seg.timestamp || '',
+          content: seg.content,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        throw new Error(data.error || '删除失败');
+      }
+      // 用服务端返回的最新文本更新本地状态
+      if (data.rawText !== undefined) {
+        setLocalRawText(data.rawText || null);
+      }
+      setConfirmDeleteIdx(null);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : '删除失败');
+    } finally {
+      setDeletingIdx(null);
+    }
+  };
 
   return (
     <div className={`history-card-item ddl-${ddlStatus}`}>
@@ -2237,20 +2289,52 @@ function HistoryCard({ record, onDelete, hideDelete }: { record: HistoryRecordIt
           {rawTextSegments.length > 0 && (
             <div className="raw-block">
               <div className="raw-label"><FileText size={13} /> 原始输入文本 ({rawTextSegments.length} 条记录)</div>
+              {deleteError && <div className="raw-delete-error"><AlertCircle size={13} /> {deleteError}</div>}
               <div className="raw-segments">
                 {rawTextSegments.map((seg, idx) => (
                   <div key={idx} className="raw-segment">
-                    {seg.timestamp && <div className="raw-segment-time">{seg.timestamp}</div>}
+                    <div className="raw-segment-header">
+                      {seg.timestamp && <span className="raw-segment-time">{seg.timestamp}</span>}
+                      {!hideDelete && confirmDeleteIdx !== idx && deletingIdx !== idx && (
+                        <button
+                          className="raw-segment-delete-btn"
+                          onClick={() => { setConfirmDeleteIdx(idx); setDeleteError(null); }}
+                          title="删除这条记录"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                      {deletingIdx === idx && <span className="raw-segment-loading">删除中...</span>}
+                    </div>
                     <pre className="raw-content">{seg.content}</pre>
+                    {confirmDeleteIdx === idx && deletingIdx !== idx && (
+                      <div className="raw-segment-confirm">
+                        <span>确定删除这条记录吗？</span>
+                        <button className="btn btn-danger-sm" onClick={() => handleDeleteSegment(idx)}>确认</button>
+                        <button className="btn btn-ghost-sm" onClick={() => setConfirmDeleteIdx(null)}>取消</button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
             </div>
           )}
-          {record.raw_image && (
+          {hasImage && !imageError && (
             <div className="raw-block">
-              <div className="raw-label">原始输入图片</div>
-              <img src={record.raw_image} alt="原始图片" className="raw-image" onClick={() => window.open(record.raw_image!, '_blank')} />
+              <div className="raw-label"><FileText size={13} /> 原始输入图片</div>
+              <img
+                src={record.raw_image!}
+                alt="原始图片"
+                className="raw-image-thumb"
+                onClick={() => setLightboxOpen(true)}
+                onError={() => setImageError(true)}
+              />
+            </div>
+          )}
+          {hasImage && imageError && (
+            <div className="raw-block">
+              <div className="raw-label"><FileText size={13} /> 原始输入图片</div>
+              <div className="raw-image-placeholder">图片不可用</div>
             </div>
           )}
           {record.source_url && (
@@ -2265,7 +2349,16 @@ function HistoryCard({ record, onDelete, hideDelete }: { record: HistoryRecordIt
               <div>{record.todo}</div>
             </div>
           )}
-          {rawTextSegments.length === 0 && !record.raw_image && <div className="muted-text">暂无原始输入记录</div>}
+          {rawTextSegments.length === 0 && !hasImage && <div className="muted-text">暂无原始输入记录</div>}
+        </div>
+      )}
+
+      {lightboxOpen && hasImage && !imageError && (
+        <div className="lightbox" onClick={() => setLightboxOpen(false)}>
+          <img src={record.raw_image!} alt="原始图片" className="lightbox-img" />
+          <button className="lightbox-close" onClick={() => setLightboxOpen(false)}>
+            <X size={20} />
+          </button>
         </div>
       )}
     </div>

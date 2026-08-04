@@ -117,8 +117,17 @@ export async function POST(request: Request) {
     // ========== single 流程 ==========
     const parsed = data as ParsedJob;
     parsed.source_channel = body.source_channel ?? null;
-    parsed.raw_text = body.content ?? null;
-    parsed.raw_image = body.image ?? null;
+    // 原始输入文本: 纯文本提交用原文, 图片提交生成 AI 识别摘要
+    if (body.content && body.content.trim()) {
+      parsed.raw_text = body.content.trim();
+    } else if (body.image) {
+      const now = new Date();
+      const ts = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      parsed.raw_text = `[图片提交 ${ts}] AI 已识别: 公司=${parsed.company ?? '未知'}, 岗位=${parsed.position ?? '未知'}`;
+    } else {
+      parsed.raw_text = null;
+    }
+    parsed.raw_image = body.image ?? null; // base64 图片, 将在 createRecord/updateRecord 中上传到钉钉
     return processSingleJob(parsed, workspace);
   } catch (error) {
     console.error('[submit] 处理异常:', error);

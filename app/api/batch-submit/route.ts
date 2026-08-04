@@ -94,7 +94,7 @@ export async function POST(request: Request) {
         source_url: sf.source_link,
         priority: '中',
         source_channel: body.source_channel ?? null,
-        raw_text: rawContent || null,
+        raw_text: rawContent.trim() || (rawImage ? `[图片提交] AI 已识别: 公司=${batch_result.source_company}, 岗位=${candidate.position}` : null),
         raw_image: rawImage || null,
       };
 

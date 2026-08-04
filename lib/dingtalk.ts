@@ -295,15 +295,149 @@ export async function fetchAllRecords(config?: WorkspaceConfig): Promise<DingTal
   return allRecords;
 }
 
-// ============== 字段构建 ==============
+// ============== 图片附件上传 ==============
+
+interface AttachmentItem {
+  filename: string;
+  size: number;
+  type: string;
+  url: string;
+  resourceId: string;
+}
 
 /**
- * 钉钉表格附件字段只接受图片 URL (http/https), 不接受 base64 或其他文本
+ * 安全解析 JSON: 先读取 text, 再 parse, 避免空响应体导致 "Unexpected end of JSON input"
  */
-function isStorableImageUrl(value: string): boolean {
-  const v = value.trim();
-  return /^https?:\/\//i.test(v);
+async function safeJsonParse<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  if (!text || !text.trim()) {
+    throw new Error('响应体为空');
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    console.error('[钉钉] JSON 解析失败, 响应前 500 字符:', text.slice(0, 500));
+    throw new Error(`响应不是有效的 JSON: ${text.slice(0, 200)}`);
+  }
 }
+
+/**
+ * 将 base64 图片上传到钉钉, 返回附件对象 (用于写入附件字段)
+ * 流程: 1.获取上传信息 → 2.PUT上传文件 → 返回附件元数据
+ * 失败时静默重试 1 次, 仍失败返回 null (不影响主流程)
+ */
+async function uploadImageAttachment(
+  token: string,
+  baseId: string,
+  operatorId: string,
+  base64Image: string
+): Promise<AttachmentItem | null> {
+  // 单次上传尝试
+  const attempt = async (): Promise<AttachmentItem | null> => {
+    try {
+    // 1. 解析 base64
+    const dataUrlMatch = base64Image.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+    let mimeType: string;
+    let base64Data: string;
+
+    if (dataUrlMatch) {
+      mimeType = dataUrlMatch[1];
+      base64Data = dataUrlMatch[2];
+    } else {
+      // 纯 base64, 默认 png
+      mimeType = 'image/png';
+      base64Data = base64Image;
+    }
+
+    const buffer = Buffer.from(base64Data, 'base64');
+    const size = buffer.length;
+    const ext = mimeType.split('/')[1] === 'jpeg' ? 'jpg' : (mimeType.split('/')[1] || 'png');
+    const resourceName = `招聘截图_${Date.now()}.${ext}`;
+
+    console.log(`[钉钉] 上传图片附件: ${mimeType}, ${size} bytes, ${resourceName}`);
+
+    // 2. 获取资源上传信息
+    const uploadInfoUrl = `${API_BASE}/v1.0/doc/docs/resources/${baseId}/uploadInfos/query?operatorId=${encodeURIComponent(operatorId)}`;
+    const infoRes = await fetch(uploadInfoUrl, {
+      method: 'POST',
+      headers: {
+        'x-acs-dingtalk-access-token': token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        size,
+        mediaType: mimeType,
+        resourceName,
+      }),
+    });
+
+    if (!infoRes.ok) {
+      const errText = await infoRes.text();
+      console.error('[钉钉] 获取上传信息失败:', infoRes.status, errText);
+      return null;
+    }
+
+    const infoDataRaw = await safeJsonParse<{
+      uploadUrl?: string;
+      resourceId?: string;
+      resourceUrl?: string;
+      result?: {
+        uploadUrl?: string;
+        resourceId?: string;
+        resourceUrl?: string;
+      };
+    }>(infoRes);
+
+    // 兼容两种响应格式: 顶层字段或嵌套在 result 中
+    const infoData = infoDataRaw.result ?? infoDataRaw;
+
+    console.log('[钉钉] 上传信息响应:', JSON.stringify(infoDataRaw));
+
+    if (!infoData.uploadUrl || !infoData.resourceId || !infoData.resourceUrl) {
+      console.error('[钉钉] 上传信息缺失字段:', JSON.stringify(infoDataRaw));
+      return null;
+    }
+
+    // 3. PUT 上传文件到 uploadUrl
+    const putRes = await fetch(infoData.uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': mimeType,
+      },
+      body: buffer,
+    });
+
+    if (!putRes.ok) {
+      const errText = await putRes.text();
+      console.error('[钉钉] PUT上传图片失败:', putRes.status, errText);
+      return null;
+    }
+
+    console.log('[钉钉] 图片上传成功, resourceId:', infoData.resourceId);
+
+    return {
+      filename: resourceName,
+      size,
+      type: mimeType,
+      url: infoData.resourceUrl,
+      resourceId: infoData.resourceId,
+    };
+    } catch (err) {
+      console.error('[钉钉] 上传图片附件异常:', err);
+      return null;
+    }
+  };
+
+  // 首次尝试
+  const result = await attempt();
+  if (result) return result;
+
+  // 静默重试 1 次
+  console.warn('[钉钉] 图片上传首次失败, 静默重试 1 次');
+  return await attempt();
+}
+
+// ============== 字段构建 ==============
 
 /**
  * 根据 ParsedJob 构建钉钉表格字段
@@ -398,10 +532,8 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   }
 
   // ---- 原始输入图片 ----
-  // 钉钉表格的图片字段是附件类型, 只接受图片 URL, 不接受 base64/文本
-  if (parsed.raw_image && isStorableImageUrl(parsed.raw_image)) {
-    fields['原始输入图片'] = parsed.raw_image.trim();
-  }
+  // 不在 buildFields 中处理, 改为在 createRecord/updateRecord 中异步上传后写入
+  // (附件字段需要先上传文件再写入, buildFields 是同步函数无法处理)
 
   return fields;
 }
@@ -540,6 +672,18 @@ export async function createRecord(parsed: ParsedJob, config?: WorkspaceConfig):
   const finalSheetId = await resolveSheetId(token, baseId, sheetId, operatorId);
 
   const fields = buildFields(parsed);
+
+  // 写入原始输入图片 (附件字段: 通过钉钉资源上传 API 上传, 失败时跳过)
+  if (parsed.raw_image && parsed.raw_image.trim()) {
+    const attachment = await uploadImageAttachment(token, baseId, operatorId, parsed.raw_image);
+    if (attachment) {
+      fields['原始输入图片'] = [attachment];
+      console.log('[钉钉] 图片附件已添加到字段');
+    } else {
+      console.warn('[钉钉] 图片附件上传失败, 跳过写入图片字段 (不影响其他字段)');
+    }
+  }
+
   console.log(`[钉钉] 准备写入的字段:`, JSON.stringify(fields, null, 2));
 
   const url = buildUrl('records', baseId, finalSheetId, operatorId);
@@ -559,12 +703,12 @@ export async function createRecord(parsed: ParsedJob, config?: WorkspaceConfig):
     throw new Error(`新增钉钉记录失败: HTTP ${res.status} - ${errText}`);
   }
 
-  const data = (await res.json()) as {
+  const data = await safeJsonParse<{
     value?: Array<{ id: string }>;
     code?: string;
     message?: string;
     requestid?: string;
-  };
+  }>(res);
 
   // 钉钉 API 有时返回 200 但响应体含错误
   if (data.code && data.message) {
@@ -625,14 +769,24 @@ export async function updateRecord(
     }
   }
 
-  // 追加原始输入图片 (同样只追加可存储的图片 URL)
-  if (existingRecord && parsed.raw_image && isStorableImageUrl(parsed.raw_image)) {
-    const existingRaw = String(existingRecord.fields['原始输入图片'] ?? '');
-    const newEntry = formatRawTextEntry(parsed.raw_image);
-    if (existingRaw) {
-      fields['原始输入图片'] = `${existingRaw}\n${'─'.repeat(20)}\n${newEntry}`;
+  // 写入原始输入图片 (附件字段: 通过钉钉资源上传 API 上传, 失败时跳过)
+  if (parsed.raw_image && parsed.raw_image.trim()) {
+    const attachment = await uploadImageAttachment(token, baseId, operatorId, parsed.raw_image);
+    if (attachment) {
+      // 已有图片附件时, 追加新附件到数组; 相同图片不重复追加
+      const existingAttachments = existingRecord?.fields?.['原始输入图片'];
+      const existingList: Array<{ url?: string }> = Array.isArray(existingAttachments)
+        ? existingAttachments.filter((a): a is { url?: string } => !!a && typeof a === 'object')
+        : [];
+      const url = typeof attachment.url === 'string' ? attachment.url : '';
+      if (existingList.some((a) => a.url === url)) {
+        console.log('[钉钉] 相同图片附件已存在, 跳过追加');
+      } else {
+        fields['原始输入图片'] = [...existingList, attachment];
+        console.log('[钉钉] 图片附件已添加到更新字段');
+      }
     } else {
-      fields['原始输入图片'] = newEntry;
+      console.warn('[钉钉] 图片附件上传失败, 跳过写入图片字段 (不影响其他字段)');
     }
   }
 
@@ -943,22 +1097,57 @@ export async function updateRecordFields(
     records: [{ id: recordId, fields }],
   };
 
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'x-acs-dingtalk-access-token': token,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
+  // 带重试机制的请求 (处理 503/500 等临时性服务端故障)
+  const MAX_RETRIES = 3;
+  let lastError: Error | null = null;
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error('钉钉轻量更新失败:', res.status, errText);
-    throw new Error(`轻量更新钉钉记录失败: HTTP ${res.status} - ${errText}`);
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'x-acs-dingtalk-access-token': token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (res.ok) {
+        console.log(`[钉钉] 轻量更新成功: recordId=${recordId}`);
+        return;
+      }
+
+      // 仅对 503/500 重试, 其他错误直接抛出
+      if (res.status === 503 || res.status === 500) {
+        const errText = await res.text();
+        console.warn(`[钉钉] 轻量更新失败 (尝试 ${attempt}/${MAX_RETRIES}): HTTP ${res.status} - ${errText}`);
+        lastError = new Error(`轻量更新钉钉记录失败: HTTP ${res.status} - ${errText}`);
+
+        if (attempt < MAX_RETRIES) {
+          const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+          console.log(`[钉钉] ${delay}ms 后重试...`);
+          await new Promise((resolve) => setTimeout(res, delay));
+          continue;
+        }
+      } else {
+        const errText = await res.text();
+        console.error('钉钉轻量更新失败:', res.status, errText);
+        throw new Error(`轻量更新钉钉记录失败: HTTP ${res.status} - ${errText}`);
+      }
+    } catch (err) {
+      // 网络错误也重试
+      if (err instanceof TypeError && attempt < MAX_RETRIES) {
+        console.warn(`[钉钉] 网络错误 (尝试 ${attempt}/${MAX_RETRIES}): ${err.message}`);
+        lastError = err;
+        const delay = Math.pow(2, attempt - 1) * 1000;
+        await new Promise((resolve) => setTimeout(res, delay));
+        continue;
+      }
+      throw err;
+    }
   }
 
-  console.log(`[钉钉] 轻量更新成功: recordId=${recordId}`);
+  throw lastError ?? new Error('轻量更新钉钉记录失败: 超过最大重试次数');
 }
 
 // ============== 辅助函数 ==============

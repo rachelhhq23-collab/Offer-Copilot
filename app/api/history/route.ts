@@ -151,6 +151,34 @@ function extractText(value: unknown): string {
 }
 
 /**
+ * 从附件字段中提取图片 URL
+ * 钉钉附件字段返回格式可能包含: url / previewUrl / downloadUrl
+ */
+function extractAttachmentUrl(value: unknown): string | null {
+  if (!value) return null;
+  if (typeof value === 'string') return value || null;
+  const urlKeys = ['url', 'resourceUrl', 'previewUrl', 'downloadUrl', 'src', 'link'];
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === 'object' && item !== null) {
+        const obj = item as Record<string, unknown>;
+        for (const key of urlKeys) {
+          if (typeof obj[key] === 'string' && obj[key]) return obj[key] as string;
+        }
+      }
+    }
+    return null;
+  }
+  if (typeof value === 'object' && value !== null) {
+    const obj = value as Record<string, unknown>;
+    for (const key of urlKeys) {
+      if (typeof obj[key] === 'string' && obj[key]) return obj[key] as string;
+    }
+  }
+  return null;
+}
+
+/**
  * 从钉钉字段值中提取字符串数组 (用于多选字段)
  */
 function extractStringArray(value: unknown): string[] {
@@ -227,7 +255,7 @@ function parseDingTalkRecord(record: DingTalkRecord): HistoryRecord {
     priority: f['优先级标记'] ? extractText(f['优先级标记']) : null,
     last_updated_time: lastUpdated,
     raw_text: f['原始输入文本'] ? extractText(f['原始输入文本']) : null,
-    raw_image: f['原始输入图片'] ? extractText(f['原始输入图片']) : null,
+    raw_image: extractAttachmentUrl(f['原始输入图片']),
     source_channel: f['信息来源渠道'] ? extractText(f['信息来源渠道']) : null,
     todo: f['待办'] ? extractText(f['待办']) : null,
     referral_code: f['内推码'] ? extractText(f['内推码']) : null,
