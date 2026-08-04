@@ -15,6 +15,13 @@ const CREDS_KEY = 'offer-copilot-dev-credentials';
 const AI_KEYS_KEY = 'offer-copilot-ai-keys';
 const DEMO_KEY = 'offer-copilot-demo-mode';
 
+// 演示模式专用工作空间配置 (前端硬编码, 不从 localStorage 读取)
+const DEMO_WORKSPACE: Workspace = {
+  id: 'demo-workspace',
+  name: '演示demo',
+  baseId: '7QG4Yx2JpLkZZz3YFQlAroAvJ9dEq3XD',
+};
+
 /** 钉钉应用凭据 */
 export interface DevCredentials {
   appKey: string;
@@ -161,29 +168,38 @@ export function useWorkspaces() {
 
   // 初始化
   useEffect(() => {
-    const stored = loadWorkspaces();
-    if (stored.length > 0) {
-      setWorkspaces(stored);
-      const active = localStorage.getItem(ACTIVE_KEY);
-      if (active && stored.some((w) => w.id === active)) {
-        setActiveId(active);
-      } else {
-        setActiveId(stored[0].id);
-        localStorage.setItem(ACTIVE_KEY, stored[0].id);
+    const isDemo = isDemoMode();
+    setDemoMode(isDemo);
+
+    if (isDemo) {
+      // 演示模式: 使用硬编码的演示工作空间, 不读取 localStorage
+      setWorkspaces([DEMO_WORKSPACE]);
+      setActiveId(DEMO_WORKSPACE.id);
+    } else {
+      // 正常模式: 从 localStorage 读取用户配置
+      const stored = loadWorkspaces();
+      if (stored.length > 0) {
+        setWorkspaces(stored);
+        const active = localStorage.getItem(ACTIVE_KEY);
+        if (active && stored.some((w) => w.id === active)) {
+          setActiveId(active);
+        } else {
+          setActiveId(stored[0].id);
+          localStorage.setItem(ACTIVE_KEY, stored[0].id);
+        }
       }
+      setCredentials(loadCredentials());
+      setAIKeys(loadAIKeys());
     }
-    setCredentials(loadCredentials());
-    setAIKeys(loadAIKeys());
-    setDemoMode(isDemoMode());
     setReady(true);
   }, []);
 
-  // 持久化工作空间
+  // 持久化工作空间 (仅非演示模式)
   useEffect(() => {
-    if (ready && workspaces.length > 0) {
+    if (ready && workspaces.length > 0 && !demoMode) {
       saveWorkspaces(workspaces);
     }
-  }, [workspaces, ready]);
+  }, [workspaces, ready, demoMode]);
 
   const setActive = useCallback((id: string) => {
     setActiveId(id);

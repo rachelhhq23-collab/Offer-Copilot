@@ -14,8 +14,17 @@ import { ESTIMATED_MINUTES_BY_STATUS } from './types';
 const APP_KEY = process.env.DEMO_DINGTALK_APP_KEY ?? '';
 const APP_SECRET = process.env.DEMO_DINGTALK_APP_SECRET ?? '';
 const DEFAULT_BASE_ID = process.env.DEMO_DINGTALK_BASE_ID ?? '';
-const DEFAULT_SHEET_ID = process.env.DEMO_DINGTALK_TABLE_ID || DEFAULT_BASE_ID || '';
+const DEFAULT_SHEET_ID = process.env.DEMO_DINGTALK_TABLE_ID ?? '';
 const OPERATOR_ID = process.env.DEMO_DINGTALK_OPERATOR_ID ?? '';
+
+function validateDemoEnv(): string[] {
+  const missing: string[] = [];
+  if (!APP_KEY) missing.push('DEMO_DINGTALK_APP_KEY');
+  if (!APP_SECRET) missing.push('DEMO_DINGTALK_APP_SECRET');
+  if (!DEFAULT_BASE_ID) missing.push('DEMO_DINGTALK_BASE_ID');
+  if (!DEFAULT_SHEET_ID) missing.push('DEMO_DINGTALK_TABLE_ID');
+  return missing;
+}
 
 const API_BASE = 'https://api.dingtalk.com';
 
@@ -43,9 +52,11 @@ export interface WorkspaceConfig {
  */
 function resolveIds(config?: WorkspaceConfig): { baseId: string; sheetId: string | undefined } {
   if (config?.demoMode) {
-    const baseId = DEFAULT_BASE_ID;
-    if (!baseId) throw new Error('演示模式缺少 DEMO_DINGTALK_BASE_ID 环境变量');
-    return { baseId, sheetId: DEFAULT_SHEET_ID || undefined };
+    const missing = validateDemoEnv();
+    if (missing.length > 0) {
+      throw new Error(`演示模式缺少环境变量: ${missing.join(', ')}。请在 Vercel 部署设置中配置这些变量。`);
+    }
+    return { baseId: DEFAULT_BASE_ID, sheetId: DEFAULT_SHEET_ID || undefined };
   }
   const baseId = config?.baseId?.trim();
   if (!baseId) {
@@ -119,7 +130,11 @@ async function resolveSheetId(
     return DEFAULT_SHEET_ID;
   }
 
-  // Case 3: 新 base, 自动检测
+  // Case 3: 自动检测
+  if (baseId === DEFAULT_BASE_ID && !DEFAULT_SHEET_ID) {
+    console.log('[钉钉] DEMO_DINGTALK_TABLE_ID 未设置, 将通过 API 自动检测 sheetId');
+  }
+
   const cached = sheetIdCache.get(baseId);
   if (cached) {
     return cached;
@@ -191,12 +206,17 @@ async function getAccessToken(config?: WorkspaceConfig): Promise<string> {
 async function getOperatorId(token: string, config?: WorkspaceConfig): Promise<string> {
   // 演示模式: 使用环境变量, 启用缓存
   if (config?.demoMode) {
-    if (operatorIdCache) return operatorIdCache;
+    if (operatorIdCache) {
+      console.log('[钉钉] 使用缓存的 operatorId');
+      return operatorIdCache;
+    }
     if (OPERATOR_ID) {
+      console.log('[钉钉] 使用环境变量中的 operatorId');
       operatorIdCache = OPERATOR_ID;
       return OPERATOR_ID;
     }
     // 演示模式也尝试自动获取
+    console.log('[钉钉] 环境变量 DEMO_DINGTALK_OPERATOR_ID 未设置, 尝试通过 API 自动获取...');
     const id = await autoFetchOperatorId(token);
     operatorIdCache = id;
     return id;
@@ -227,11 +247,15 @@ async function autoFetchOperatorId(token: string): Promise<string> {
         console.log(`[钉钉] 自动获取 operatorId 成功: ${data.unionId}`);
         return data.unionId;
       }
+      console.error('[钉钉] 自动获取 operatorId: API 返回数据中无 unionId 字段');
+    } else {
+      const errText = await res.text();
+      console.error(`[钉钉] 自动获取 operatorId 失败: HTTP ${res.status} - ${errText}`);
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    console.error('[钉钉] 自动获取 operatorId 异常:', err instanceof Error ? err.message : err);
   }
-  throw new Error('自动获取 operatorId 失败, 请手动填写 UnionId');
+  throw new Error('自动获取 operatorId 失败。请在 Vercel 环境变量中设置 DEMO_DINGTALK_OPERATOR_ID');
 }
 
 // ============== 通用请求 ==============
@@ -1126,7 +1150,7 @@ export async function updateRecordFields(
         if (attempt < MAX_RETRIES) {
           const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
           console.log(`[钉钉] ${delay}ms 后重试...`);
-          await new Promise((resolve) => setTimeout(res, delay));
+          await new Promise<void>((resolve) => setTimeout(() => resolve(), delay));
           continue;
         }
       } else {
@@ -1140,7 +1164,7 @@ export async function updateRecordFields(
         console.warn(`[钉钉] 网络错误 (尝试 ${attempt}/${MAX_RETRIES}): ${err.message}`);
         lastError = err;
         const delay = Math.pow(2, attempt - 1) * 1000;
-        await new Promise((resolve) => setTimeout(res, delay));
+        await new Promise<void>((resolve) => setTimeout(() => resolve(), delay));
         continue;
       }
       throw err;

@@ -1691,7 +1691,6 @@ export default function HomePage() {
                     key={rec.recordId}
                     record={rec}
                     onDelete={() => handleDeleteRecord(rec.recordId)}
-                    hideDelete={demoMode}
                     workspaceHeader={workspaceHeader}
                   />
                 ))}
@@ -2190,7 +2189,7 @@ function parseRawTextSegments(rawText: string): Array<{ timestamp: string | null
   return segments.reverse();
 }
 
-function HistoryCard({ record, onDelete, hideDelete, workspaceHeader }: { record: HistoryRecordItem; onDelete: () => void; hideDelete?: boolean; workspaceHeader: Record<string, string> }) {
+function HistoryCard({ record, onDelete, workspaceHeader }: { record: HistoryRecordItem; onDelete: () => void; workspaceHeader: Record<string, string> }) {
   const [expanded, setExpanded] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [imageError, setImageError] = useState(false);
@@ -2241,11 +2240,9 @@ function HistoryCard({ record, onDelete, hideDelete, workspaceHeader }: { record
 
   return (
     <div className={`history-card-item ddl-${ddlStatus}`}>
-      {!hideDelete && (
-        <button className="delete-btn" onClick={onDelete} title="删除">
-          <Trash2 size={14} />
-        </button>
-      )}
+      <button className="delete-btn" onClick={onDelete} title="删除">
+        <Trash2 size={14} />
+      </button>
 
       <div className="history-title-row">
         <span className="history-company"><strong>{record.company}</strong></span>
@@ -2295,7 +2292,7 @@ function HistoryCard({ record, onDelete, hideDelete, workspaceHeader }: { record
                   <div key={idx} className="raw-segment">
                     <div className="raw-segment-header">
                       {seg.timestamp && <span className="raw-segment-time">{seg.timestamp}</span>}
-                      {!hideDelete && confirmDeleteIdx !== idx && deletingIdx !== idx && (
+                      {confirmDeleteIdx !== idx && deletingIdx !== idx && (
                         <button
                           className="raw-segment-delete-btn"
                           onClick={() => { setConfirmDeleteIdx(idx); setDeleteError(null); }}
