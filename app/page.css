@@ -940,6 +940,7 @@
 
 .source-required {
   color: var(--color-danger);
+  margin-left: 2px;
 }
 
 .source-optional {
@@ -1965,6 +1966,15 @@
   background: var(--color-brand-light);
 }
 
+.candidate-item.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.candidate-item.disabled:hover {
+  border-color: var(--color-border);
+}
+
 .candidate-checkbox {
   margin-top: 3px;
   width: 16px;
@@ -2163,6 +2173,40 @@
 .plan-item.deferred {
   border-left-color: transparent;
   opacity: 0.65;
+}
+
+.plan-item.completed {
+  opacity: 0.5;
+}
+
+.plan-item.completed .plan-item-company,
+.plan-item.completed .plan-item-position,
+.plan-item.completed .plan-item-action {
+  text-decoration: line-through;
+}
+
+.plan-item-toggle {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--color-text-muted);
+  padding: 0;
+  margin-top: 1px;
+  transition: color 0.15s;
+}
+
+.plan-item-toggle:hover {
+  color: var(--color-brand);
+}
+
+.plan-item.completed .plan-item-toggle {
+  color: var(--color-success, #2d7d2d);
 }
 
 .plan-item-index {

@@ -26,14 +26,6 @@ import type {
 
 export const runtime = 'nodejs';
 
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '10mb',
-    },
-  },
-};
-
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as BatchSubmitRequest & { content?: string; demoMode?: boolean };
@@ -62,111 +54,110 @@ export async function POST(request: Request) {
     }
 
     const existingRecords = await fetchAllRecords(workspace);
-    const results: BatchSubmitResponse['results'] = [];
 
-    for (const index of selected_indices) {
-      const candidate: BatchCandidate | undefined = batch_result.candidates[index];
-      if (!candidate) continue;
+    // 占位文本清理函数 (所有候选共用)
+    const cleanPlaceholder = (v: string | null | undefined): string | null => {
+      if (!v) return null;
+      const t = v.trim();
+      if (!t) return null;
+      if (/^(暂无|无|未知|没有|未提及|不[详用])/.test(t)) return null;
+      if (/^暂无.*(描述|要求|信息|岗位)/.test(t)) return null;
+      return t;
+    };
 
-      const sf: BatchSharedFields = batch_result.shared_fields;
+    // 并行处理所有选中的候选岗位 (各岗位互相独立, 无需串行)
+    const results = await Promise.all(
+      selected_indices.map(async (index): Promise<BatchSubmitResponse['results'][number] | null> => {
+        const candidate: BatchCandidate | undefined = batch_result.candidates[index];
+        if (!candidate) return null;
 
-      // ---- 构建待办文本 (动态生成, 包含关键信息) ----
-      const todo = buildTodo(candidate, sf);
+        const sf: BatchSharedFields = batch_result.shared_fields;
+        const todo = buildTodo(candidate, sf);
 
-      // ---- 构建 ParsedJob ----
-      // 直接清理 candidate 中的占位文本, 避免 AI 返回 "暂无岗位要求描述" 等无效内容
-      const cleanPlaceholder = (v: string | null | undefined): string | null => {
-        if (!v) return null;
-        const t = v.trim();
-        if (!t) return null;
-        if (/^(暂无|无|未知|没有|未提及|不[详用])/.test(t)) return null;
-        if (/^暂无.*(描述|要求|信息|岗位)/.test(t)) return null;
-        return t;
-      };
+        const parsed: ParsedJob = {
+          message_type: 'single',
+          company: batch_result.source_company,
+          position: candidate.position,
+          job_code: candidate.job_code,
+          city: sf.city,
+          deadline: sf.deadline,
+          description: cleanPlaceholder(candidate.description),
+          requirements: cleanPlaceholder(candidate.requirements) ?? cleanPlaceholder(sf.requirements),
+          application_limit: sf.application_limit,
+          referral_code: sf.referral_code,
+          status_hint: '待投递',
+          todo,
+          estimated_minutes: todo ? 20 : null,
+          match_key: `${batch_result.source_company}-${candidate.position}`,
+          source_url: sf.source_link,
+          priority: '中',
+          source_channel: body.source_channel ?? null,
+          raw_text: rawContent.trim() || (rawImage ? `[图片提交] AI 已识别: 公司=${batch_result.source_company}, 岗位=${candidate.position}` : null),
+          raw_image: rawImage || null,
+        };
 
-      const parsed: ParsedJob = {
-        message_type: 'single',
-        company: batch_result.source_company,
-        position: candidate.position,
-        job_code: candidate.job_code,
-        city: sf.city,
-        deadline: sf.deadline,
-        description: cleanPlaceholder(candidate.description),
-        requirements: cleanPlaceholder(candidate.requirements) ?? cleanPlaceholder(sf.requirements),
-        application_limit: sf.application_limit,
-        referral_code: sf.referral_code,
-        status_hint: '待投递',
-        todo,
-        estimated_minutes: todo ? 20 : null,
-        match_key: `${batch_result.source_company}-${candidate.position}`,
-        source_url: sf.source_link,
-        priority: '中',
-        source_channel: body.source_channel ?? null,
-        raw_text: rawContent.trim() || (rawImage ? `[图片提交] AI 已识别: 公司=${batch_result.source_company}, 岗位=${candidate.position}` : null),
-        raw_image: rawImage || null,
-      };
-
-      // ---- 校验 ----
-      const validation = validateParsedJob(parsed);
-      if (!validation.valid) {
-        results.push({
-          candidate,
-          action: 'created',
-          recordId: '',
-          message: `⚠️ ${candidate.position}: ${validation.errors[0]}`,
-        });
-        continue;
-      }
-
-      const cleaned = validation.cleaned;
-
-      // ---- 匹配 + 新增/更新 ----
-      try {
-        const matched = await matchRecord(cleaned, existingRecords);
-        let action: 'created' | 'updated';
-        let recordId: string;
-
-        if (matched) {
-          const rec = await updateRecord(matched.recordId, cleaned, matched, workspace);
-          action = 'updated';
-          recordId = rec.recordId;
-        } else {
-          const rec = await createRecord(cleaned, workspace);
-          action = 'created';
-          recordId = rec.recordId;
-          // 加入 existingRecords 供后续匹配
-          existingRecords.push(rec);
+        // ---- 校验 ----
+        const validation = validateParsedJob(parsed);
+        if (!validation.valid) {
+          return {
+            candidate,
+            action: 'created',
+            recordId: '',
+            message: `⚠️ ${candidate.position}: ${validation.errors[0]}`,
+          };
         }
 
-        results.push({
-          candidate,
-          action,
-          recordId,
-          message:
-            action === 'created'
-              ? `✅ 新增: ${cleaned.position}`
-              : `🔄 更新: ${cleaned.position}`,
-        });
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : '未知错误';
-        results.push({
-          candidate,
-          action: 'created',
-          recordId: '',
-          message: `⚠️ ${candidate.position}: ${errMsg}`,
-        });
-      }
-    }
+        const cleaned = validation.cleaned;
+
+        // ---- 匹配 + 新增/更新 ----
+        try {
+          const matched = await matchRecord(cleaned, existingRecords);
+          let action: 'created' | 'updated';
+          let recordId: string;
+
+          if (matched) {
+            const rec = await updateRecord(matched.recordId, cleaned, matched, workspace);
+            action = 'updated';
+            recordId = rec.recordId;
+          } else {
+            const rec = await createRecord(cleaned, workspace);
+            action = 'created';
+            recordId = rec.recordId;
+          }
+
+          return {
+            candidate,
+            action,
+            recordId,
+            message:
+              action === 'created'
+                ? `✅ 新增: ${cleaned.position}`
+                : `🔄 更新: ${cleaned.position}`,
+          };
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : '未知错误';
+          return {
+            candidate,
+            action: 'created',
+            recordId: '',
+            message: `⚠️ ${candidate.position}: ${errMsg}`,
+          };
+        }
+      })
+    );
+
+    // 过滤掉无效索引的 null 项
+    const filteredResults = results.filter((r): r is BatchSubmitResponse['results'][number] => r !== null);
 
     // 汇总
-    const created = results.filter((r) => r.action === 'created').length;
-    const updated = results.filter((r) => r.action === 'updated').length;
-    const failed = results.filter((r) => !r.recordId).length;
+    const created = filteredResults.filter((r) => r.action === 'created').length;
+    const updated = filteredResults.filter((r) => r.action === 'updated').length;
+    const failed = filteredResults.filter((r) => !r.recordId).length;
 
     return NextResponse.json({
       success: true,
-      results,
-      message: `共处理 ${results.length} 个岗位: 新增 ${created}, 更新 ${updated}${failed > 0 ? `, 失败 ${failed}` : ''}`,
+      results: filteredResults,
+      message: `共处理 ${filteredResults.length} 个岗位: 新增 ${created}, 更新 ${updated}${failed > 0 ? `, 失败 ${failed}` : ''}`,
     } satisfies BatchSubmitResponse);
   } catch (error) {
     console.error('[batch-submit] 处理异常:', error);

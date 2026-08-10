@@ -13,7 +13,7 @@ import type {
   MessageType,
   BatchSharedFields,
 } from './types';
-import { ESTIMATED_MINUTES_BY_STATUS } from './types';
+import { ESTIMATED_MINUTES_BY_STATUS, isWaitingTypeTodo } from './types';
 
 // ============== 环境变量 (仅演示模式使用) ==============
 
@@ -85,13 +85,21 @@ function buildSystemPrompt(): string {
 - "收到Offer" → 状态: Offer, 待办: 确认Offer
 - "简历挂"/"测评挂"/"笔试挂"/"面试挂" → 对应挂状态, 待办: null
 - "DDL改为XXX"/"截止日期XXX" → 只更新 deadline 字段, 其他不变
+- "一面结束"/"二面结束"/"面试结束了" → 状态不变(保留原状态), 待办: "XX结束, 等待下一步通知"(例如"一面结束, 等待下一步通知")
+- "测评完成"/"笔试完成"/"已完成测评" → 状态不变, 待办: "测评完成, 等待结果" 或 "笔试完成, 等待结果"
+
+【优先级判断规则 - 必须严格遵守, 覆盖DDL距离判断】
+- 高优先级: 状态为"待投递""测评""笔试""AI面""群面""一面""二面""三面""HR面" (即需要用户采取行动的状态, 这类DDL通常在一周内)
+- 中优先级: 收到明确通知且DDL在7-30天
+- 低优先级: 状态为"已投递""Offer""已拒绝" 或 DDL在30天以上 (即已完成当前步骤, 等待结果的状态)
+- 暂缓: 所有场次都已过期, 或状态为"简历挂""测评挂""笔试挂""面试挂""已挂"
 
 === 格式 A: single (单一岗位) ===
 {
   "message_type": "single",
   "company": "公司名称, 识别不到就填 null",
   "position": "岗位名称, 识别不到就填 null",
-  "job_code": "岗位编号, 比如 J100665, 没有就填 null",
+  "job_code": "岗位编号, 必须是消息正文中明确标注的岗位编号(如 J100665, A1024B), 没有就填 null。严禁从URL参数中提取id/pid等数字作为岗位编号",
   "city": ["城市数组, 只能从预设选项中选, 没提到就填 ['未知']"],
   "deadline": "格式 YYYY-MM-DD, 招满即止/不设截止就填 null",
   "description": "岗位描述, 没有明确描述就填 null",
@@ -108,12 +116,12 @@ function buildSystemPrompt(): string {
                         AI面/群面/一面/二面/三面/HR面=120,
                         已投递/Offer/已拒绝/简历挂/测评挂/笔试挂/面试挂/已挂=null (流程已结束或无需用户行动)。
                         如果 todo 为 null, 这里必须也是 null",
-  "source_url": "报名链接或原文中的URL, 没有就填 null, 不要加markdown反引号",
-  "priority": "优先级, 只能是预设选项之一。判断逻辑(基于当前日期):
-              - 高: 最近一个未过期场次在7天内, 或内容有'急招'/'紧急'/'尽快'等关键词
-              - 中: 最近一个未过期场次在7-30天内
-              - 低: 最近一个未过期场次在30天以上, 或没有截止日期但有明确投递要求
-              - 暂缓: 所有场次都已过期, 或没有截止日期且优先级不明确",
+  "source_url": "与当前状态最相关的链接。面试通知→填面试链接, 测评通知→填测评链接, 招聘信息→填网申/报名链接。不要填飞书下载等通用工具链接。没有就填 null, 不要加markdown反引号",
+  "priority": "优先级, 只能是预设选项之一。按状态优先判断(覆盖DDL距离):
+              - 高: 状态为待投递/测评/笔试/AI面/群面/一面/二面/三面/HR面 (需要用户采取行动的状态)
+              - 中: 状态为待投递但DDL在30天以上, 或DDL在7-30天
+              - 低: 状态为已投递/Offer/已拒绝, 或DDL在30天以上且无紧迫任务
+              - 暂缓: 所有场次都已过期, 或状态为简历挂/测评挂/笔试挂/面试挂/已挂",
   "remark": "备注信息, 没有就填 null",
   "match_key": "公司+岗位组合, 用于模糊匹配兜底"
 }
@@ -133,7 +141,7 @@ function buildSystemPrompt(): string {
   "candidates": [
     {
       "position": "具体岗位/职位名称",
-      "job_code": "该岗位单独的编号, 没有就填 null",
+      "job_code": "该岗位单独的编号, 必须是正文明确标注的, 严禁从URL参数提取, 没有就填 null",
       "description": "该岗位单独的描述, 没有就填 null",
       "requirements": "该岗位的要求。如果消息有共享的学历/专业/面向对象等要求, 必须填入此处, 不能填 null"
     }
@@ -185,7 +193,8 @@ async function fetchWithTimeout(
  * 解析 AI 返回的 JSON 字符串, 自动识别 single / batch
  */
 function parseJsonFromAi(
-  textContent: string
+  textContent: string,
+  rawText?: string
 ): { message_type: MessageType; data: ParsedJob | BatchParsedResult } {
   let jsonStr = textContent.trim();
 
@@ -239,12 +248,32 @@ function parseJsonFromAi(
     // single 格式
     const city = normalizeCityArray(parsed.city ?? ['未知']);
 
-    // 强制修正: 根据状态对照表重新计算 estimated_minutes, 确保与状态严格对齐
     const status = parsed.status_hint ?? '待投递';
-    const todo = parsed.todo ?? null;
-    let estimatedMinutes: number | null = null;
+    let todo = parsed.todo ?? null;
 
-    if (todo) {
+    // 行动型状态 AI 漏填 todo 时, 自动补充默认待办 (防止 AI 只写了状态没写 todo 导致优先级/预计耗时出错)
+    const actionStatusDefaults: Record<string, string> = {
+      '待投递': '投递简历',
+      '测评': '完成测评',
+      '笔试': '参加笔试',
+      'AI面': '准备AI面试',
+      '群面': '准备群面',
+      '一面': '准备一面',
+      '二面': '准备二面',
+      '三面': '准备三面',
+      'HR面': '准备HR面试',
+    };
+    if (!todo && actionStatusDefaults[status]) {
+      todo = actionStatusDefaults[status];
+      console.log(`[AI解析] 行动型状态 ${status} 缺少 todo, 自动补全为 "${todo}"`);
+    }
+
+    // 如果todo是"等待结果"类文本, 视为无需用户行动 → 清空estimated_minutes
+    const isNoActionTodo = isWaitingTypeTodo(todo);
+
+    // 强制修正: 根据状态+待办类型重新计算 estimated_minutes, 确保与状态严格对齐
+    let estimatedMinutes: number | null = null;
+    if (todo && !isNoActionTodo) {
       // 笔试特殊处理: 如果 AI 返回的不是默认 60 (说明原文提到了具体时长, 如 90 分钟), 保留真实值
       const aiMinutes = parsed.estimated_minutes ?? null;
       if (status === '笔试' && aiMinutes !== null && aiMinutes !== 60) {
@@ -270,6 +299,27 @@ function parseJsonFromAi(
     }
     console.log(`[AI解析] match_key: "${matchKey}" (company="${company}", position="${position}")`);
 
+    // 优先级强制修正: 按状态驱动, 覆盖 AI 返回值
+    const highPriorityStatuses = [
+      '待投递', '测评', '笔试', 'AI面', '群面', '一面', '二面', '三面', 'HR面'
+    ];
+    const suspendedStatuses = ['简历挂', '测评挂', '笔试挂', '面试挂', '已挂'];
+    const lowPriorityStatuses = ['已投递', 'Offer', '已拒绝'];
+    let priority = parsed.priority ?? '中';
+    if (highPriorityStatuses.includes(status)) {
+      // 但如果是等待结果场景 (如"一面结束了等待结果", 状态还是"一面", 但实际已完成), 降为低
+      if (isNoActionTodo) {
+        priority = '低';
+      } else {
+        priority = '高';
+      }
+    } else if (suspendedStatuses.includes(status)) {
+      priority = '暂缓';
+    } else if (lowPriorityStatuses.includes(status)) {
+      priority = '低';
+    }
+    console.log(`[AI解析] 状态="${status}", todo="${todo ?? 'null'}" → 优先级修正为 "${priority}" (原始="${parsed.priority ?? '中'}")`);
+
     const data: ParsedJob = {
       message_type: 'single',
       company: parsed.company ?? null,
@@ -285,13 +335,59 @@ function parseJsonFromAi(
       todo,
       estimated_minutes: estimatedMinutes,
       match_key: matchKey,
-      source_url: parsed.source_url ?? null,
-      priority: parsed.priority ?? '中',
+      source_url: resolveSourceUrl(parsed.source_url, status, rawText ?? ''),
+      priority,
       remark: parsed.remark ?? null,
       locations: Array.isArray(parsed.locations) ? parsed.locations : [],
     };
     return { message_type: 'single', data };
   }
+}
+
+/**
+ * 根据状态从原始文本中智能选择最相关的URL
+ * AI 偶尔会返回错误的URL (如面试通知返回网申链接), 这里做后处理校验
+ */
+function resolveSourceUrl(aiUrl: string | null | undefined, status: string, rawText: string): string | null {
+  if (!aiUrl) return null;
+  if (!rawText) return aiUrl; // 图片解析等无原始文本场景, 信任 AI 返回值
+
+  // 从原始文本中提取所有 URL
+  const urlPattern = /https?:\/\/[^\s`"'，。、）)\]】]+/g;
+  const allUrls = rawText.match(urlPattern) ?? [];
+
+  // 排除通用工具链接 (飞书下载等)
+  const toolDomains = ['feishu.cn/download', 'feishu.cn/dl', 'larksuite.com/download'];
+  const candidateUrls = allUrls.filter((u) => !toolDomains.some((d) => u.includes(d)));
+
+  // 根据状态匹配最相关的 URL
+  const statusUrlPatterns: Record<string, string[]> = {
+    '测评': ['eztest', 'exam', 'test', 'assessment', 'ceping', 'eval'],
+    '笔试': ['exam', 'test', 'nowcoder', 'code', 'niuke'],
+    'AI面': ['meeting', 'interview', 'video', 'zijieimg', 'feishu.cn', 'lark', 'zoom', 'tencentmeeting'],
+    '群面': ['meeting', 'interview', 'video', 'zijieimg', 'feishu.cn', 'lark', 'zoom', 'tencentmeeting'],
+    '一面': ['meeting', 'interview', 'video', 'zijieimg', 'feishu.cn', 'lark', 'zoom', 'tencentmeeting'],
+    '二面': ['meeting', 'interview', 'video', 'zijieimg', 'feishu.cn', 'lark', 'zoom', 'tencentmeeting'],
+    '三面': ['meeting', 'interview', 'video', 'zijieimg', 'feishu.cn', 'lark', 'zoom', 'tencentmeeting'],
+    'HR面': ['meeting', 'interview', 'video', 'zijieimg', 'feishu.cn', 'lark', 'zoom', 'tencentmeeting'],
+  };
+
+  const patterns = statusUrlPatterns[status];
+  if (patterns && candidateUrls.length > 0) {
+    // 找到匹配状态关键词的URL
+    const matched = candidateUrls.find((u) =>
+      patterns.some((p) => u.toLowerCase().includes(p))
+    );
+    if (matched) {
+      const cleaned = matched.replace(/[`"'，。、）)\]】]+$/, '');
+      if (cleaned !== aiUrl) {
+        console.log(`[AI解析] source_url 智能修正: 状态=${status}, AI返回=${aiUrl}, 修正为=${cleaned}`);
+      }
+      return cleaned;
+    }
+  }
+
+  return aiUrl;
 }
 
 /**
@@ -412,43 +508,137 @@ async function parseTextWithDeepseek(
     throw new Error('Deepseek 返回内容为空');
   }
 
-  return parseJsonFromAi(textContent);
+  return parseJsonFromAi(textContent, content);
+}
+
+// ============== 图片解析后处理: 清除AI幻觉 ==============
+
+/**
+ * 检测AI是否编造了城市信息。
+ * 图片中未明确提到城市时, AI容易编造热门城市(如北京/上海/深圳)。
+ * 判断逻辑: 如果只有1个城市且是热门城市, 极可能是编造的
+ */
+function isLikelyFabricatedCity(cities: string[]): boolean {
+  const hotCities = ['北京', '上海', '深圳', '广州', '杭州', '成都'];
+  if (cities.length === 0) return false;
+  if (cities.length > 2) return false;
+  // 只有1-2个城市且全是热门城市, 极可能是编造
+  return cities.every((c) => hotCities.includes(c));
+}
+
+/**
+ * 检测AI是否编造了日期。
+ * 图片中未明确提到日期时, AI容易编造"12月31日"或未来日期。
+ */
+function isLikelyFabricatedDeadline(deadline: string | null): boolean {
+  if (!deadline) return false;
+  // 常见编造日期: 12月31日, 6月30日等月末日期
+  const fabricatedPatterns = [
+    /-12-31$/,
+    /-06-30$/,
+    /-01-01$/,
+    /-12-?\d{2}$/, // 12月的任何日期
+  ];
+  return fabricatedPatterns.some((p) => p.test(deadline));
+}
+
+function sanitizeImageResult(
+  result: { message_type: MessageType; data: ParsedJob | BatchParsedResult }
+): { message_type: MessageType; data: ParsedJob | BatchParsedResult } {
+  const { message_type, data } = result;
+
+  if (message_type === 'batch') {
+    const batchData = data as BatchParsedResult;
+    const sf = batchData.shared_fields;
+
+    // 清除可能编造的城市
+    if (sf.city && isLikelyFabricatedCity(sf.city)) {
+      console.warn(`[图片后处理] 检测到可能编造的城市: ${sf.city}, 清除为["未知"]`);
+      sf.city = ['未知'];
+    }
+
+    // 清除可能编造的日期
+    if (isLikelyFabricatedDeadline(sf.deadline)) {
+      console.warn(`[图片后处理] 检测到可能编造的日期: ${sf.deadline}, 清除为null`);
+      sf.deadline = null;
+    }
+
+    // 没有截止日期时, 优先级降为低
+    if (!sf.deadline && batchData.candidates.length > 0) {
+      // priority 在 batch 中不存在, 无需处理
+    }
+  } else {
+    const jobData = data as ParsedJob;
+
+    // 清除可能编造的城市
+    if (jobData.city && isLikelyFabricatedCity(jobData.city)) {
+      console.warn(`[图片后处理] 检测到可能编造的城市: ${jobData.city}, 清除为["未知"]`);
+      jobData.city = ['未知'];
+    }
+
+    // 清除可能编造的日期
+    if (isLikelyFabricatedDeadline(jobData.deadline)) {
+      console.warn(`[图片后处理] 检测到可能编造的日期: ${jobData.deadline}, 清除为null`);
+      jobData.deadline = null;
+    }
+
+    // 没有截止日期时, 优先级降为低
+    if (!jobData.deadline && jobData.priority !== '高') {
+      jobData.priority = '低';
+    }
+  }
+
+  return result;
 }
 
 // ============== 图片解析 (千问) ==============
 
-const VISION_PROMPT = `请识别这张图片中的所有文字内容, 然后提取招聘相关信息, 严格按以下 JSON 格式输出。
+const VISION_PROMPT = `请仔细识别这张图片中的所有文字内容, 然后提取招聘相关信息, 严格按以下 JSON 格式输出。
 
 当前日期: ${new Date().getFullYear()}年${new Date().getMonth() + 1}月${new Date().getDate()}日
 
-提取规则:
+【核心原则 - 必须严格遵守】
+- 只提取图片中【明确出现】的文字信息, 看不到的一律填 null
+- 严禁脑补/推测/编造任何图片中没有的信息
+- 宁可信息少, 不可编造信息
+
+【字段提取规则】
 - company: 公司名称 (必填, 从图片中找)
 - position: 岗位名称 (必填, 从图片中找所有岗位)
-- city: 城市数组, 只能选: 北京/上海/深圳/广州/杭州/成都/海外/其他/未知
-- deadline: 截止日期, 格式 YYYY-MM-DD, 没有填 null
-- referral_code: 内推码, 没有填 null
-- source_url: 报名链接, 没有填 null
-- requirements: 学历/专业/面向对象等要求, 没有填 null
+- city: 只有图片明确提到城市时才提取, 没提就填 ["未知"]
+- deadline: 只有图片明确写了截止日期/DDL/截止时间时才填写 YYYY-MM-DD, 没写就填 null, 严禁编造日期
+- referral_code: 只有图片明确写了内推码时才提取, 没有填 null
+- source_url: 只有图片明确有链接时才提取, 没有填 null
+- requirements: 只有图片明确写了学历/专业/面向对象等要求时才提取, 没有填 null
 - status_hint: 状态, 默认"待投递"
-- priority: 优先级 高/中/低/暂缓
+- priority: 只有图片明确提到优先级(如急招/紧急)时才设为高, 没有截止日期时默认"低"
 
-判断 single vs batch:
-- 图片中有 2 个或以上不同岗位 → message_type = "batch", 每个岗位放在 candidates 数组
+【batch 判断规则】
+- 图片中列出多个岗位(如校招岗位列表) → message_type = "batch"
 - 只有 1 个岗位 → message_type = "single"
+- 如果图片标题是"XX届校园招聘"但正文列出了多个具体岗位(如"算法工程师""前端工程师""产品经理"), 必须判为 batch
+
+【batch candidates 提取规则 - 严格执行】
+1. 如果图片中岗位总数 ≤ 15个: 把每个具体岗位名称都放进 candidates 数组
+2. 如果图片中岗位总数 > 15个 (如按岗位族/类别分类, 每类下还有多个细分岗位):
+   - 只提取一级分类(岗位族)作为 candidates, 不要展开细分岗位
+   - 例如图片中有"算法类(含NLP/CV/推荐算法等)"→ candidates 中只放"算法类"
+   - 例如图片中有"研发类(含前端/后端/移动端等)"→ candidates 中只放"研发类"
+3. 如果图片只有公司名和招聘大类, 没有具体岗位: candidates 填空数组 [], position 填 "校招岗位"
 
 === single 格式 ===
 {
   "message_type": "single",
   "company": "公司名",
   "position": "岗位名",
-  "city": ["城市"],
-  "deadline": "2026-08-15",
+  "city": ["城市或未知"],
+  "deadline": "2026-08-15 或 null",
   "referral_code": "内推码或null",
   "source_url": "链接或null",
   "requirements": "要求或null",
   "description": null,
   "status_hint": "待投递",
-  "priority": "中",
+  "priority": "低",
   "match_key": "公司-岗位"
 }
 
@@ -457,15 +647,15 @@ const VISION_PROMPT = `请识别这张图片中的所有文字内容, 然后提�
   "message_type": "batch",
   "source_company": "公司名",
   "shared_fields": {
-    "deadline": "2026-08-15",
+    "deadline": "2026-08-15 或 null",
     "referral_code": "内推码或null",
     "source_link": "链接或null",
-    "city": ["城市"],
+    "city": ["城市或未知"],
     "requirements": "共享要求或null"
   },
   "candidates": [
-    {"position": "岗位1", "description": null, "requirements": null},
-    {"position": "岗位2", "description": null, "requirements": null}
+    {"position": "岗位族1或具体岗位1", "description": null, "requirements": null},
+    {"position": "岗位族2或具体岗位2", "description": null, "requirements": null}
   ]
 }
 
@@ -553,7 +743,10 @@ async function parseImageWithQwen(
 
     console.log('[千问] 原始返回:', textContent.slice(0, 500));
 
-    return parseJsonFromAi(textContent);
+    const result = parseJsonFromAi(textContent);
+
+    // 图片解析后处理: 清除AI可能编造的字段
+    return sanitizeImageResult(result);
   };
 
   try {

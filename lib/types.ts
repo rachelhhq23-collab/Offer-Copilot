@@ -56,8 +56,19 @@ export interface ParsedJob {
   raw_text?: string | null;
   /** 原始输入图片 (base64 或 URL) */
   raw_image?: string | null;
+  /** 预上传的图片附件 (已上传到钉钉, 跳过 createRecord/updateRecord 内的上传步骤) */
+  preUploadedAttachment?: PreUploadedAttachment | null;
   /** 多个场次信息 (可选, 用于内部计算) */
   locations?: JobLocation[];
+}
+
+/** 预上传的图片附件 (与 dingtalk.ts 的 AttachmentItem 结构一致) */
+export interface PreUploadedAttachment {
+  filename: string;
+  size: number;
+  type: string;
+  url: string;
+  resourceId: string;
 }
 
 /** 单个场次信息 (内部使用, 不直接写入) */
@@ -175,6 +186,20 @@ export const ESTIMATED_MINUTES_BY_STATUS: Record<string, number | null> = {
   面试挂: null,
   已挂: null,
 };
+
+/**
+ * 判断待办是否为"等待结果"类（无需用户行动）。
+ * 这类待办虽然非空, 但用户无需做任何事, 因此预计耗时应为 null。
+ * 场景: "一面结束, 等待下一步通知""测评完成, 等待结果""等待筛选结果"等
+ */
+export function isWaitingTypeTodo(todo: string | null | undefined): boolean {
+  if (!todo) return false;
+  const waitingKeywords = [
+    '等待', '等结果', '等通知',
+    '结束了', '已结束', '完成了', '已完成', '完成测评', '完成笔试',
+  ];
+  return waitingKeywords.some((kw) => todo.includes(kw));
+}
 
 /** 有效优先级列表 (与钉钉表格中的单选字段选项一致) */
 export const VALID_PRIORITIES = ['高', '中', '低', '暂缓'] as const;

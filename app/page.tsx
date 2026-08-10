@@ -1051,7 +1051,7 @@ export default function HomePage() {
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [sourceChannel, setSourceChannel] = useState<string>('');
+  const [sourceChannels, setSourceChannels] = useState<string[]>([]);
   const [sourceError, setSourceError] = useState('');
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [batchSubmitting, setBatchSubmitting] = useState(false);
@@ -1069,6 +1069,7 @@ export default function HomePage() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planResult, setPlanResult] = useState<PlanResult | null>(null);
   const [planError, setPlanError] = useState('');
+  const [completedPlanIndices, setCompletedPlanIndices] = useState<Set<number>>(new Set());
 
   const [showDeferred, setShowDeferred] = useState(false);
 
@@ -1209,6 +1210,10 @@ export default function HomePage() {
       setError('请输入文字内容或上传图片');
       return;
     }
+    if (sourceChannels.length === 0) {
+      setSourceError('请选择信息来源');
+      return;
+    }
 
     setLoading(true);
     setError('');
@@ -1224,8 +1229,8 @@ export default function HomePage() {
         body.image = imageBase64;
         body.inputType = 'image';
       }
-      // 信息来源可选, 默认"其他"
-      body.source_channel = sourceChannel || '其他';
+      // 信息来源必填 (多选, 逗号拼接)
+      body.source_channel = sourceChannels.join(', ');
       if (wsConfig) body.workspace = wsConfig;
       if (!demoMode && aiKeys?.deepseekKey) body.deepseekKey = aiKeys.deepseekKey;
       if (!demoMode && aiKeys?.qwenKey) body.qwenKey = aiKeys.qwenKey;
@@ -1270,7 +1275,7 @@ export default function HomePage() {
         body: JSON.stringify({
           selected_indices: selectedIndices,
           batch_result: result.batch_result,
-          source_channel: sourceChannel || '其他',
+          source_channel: sourceChannels.join(', '),
           content: content,
           ...(imageBase64 ? { image: imageBase64 } : {}),
           ...(wsConfig ? { workspace: wsConfig } : {}),
@@ -1315,7 +1320,7 @@ export default function HomePage() {
     setImageName('');
     setResult(null);
     setError('');
-    setSourceChannel('');
+    setSourceChannels([]);
     setSourceError('');
     setSelectedIndices([]);
     setBatchResult(null);
@@ -1373,6 +1378,7 @@ export default function HomePage() {
     }
     setPlanError('');
     setPlanResult(null);
+    setCompletedPlanIndices(new Set());
     setPlanLoading(true);
     try {
       const res = await fetch('/api/plan', {
@@ -1549,7 +1555,7 @@ export default function HomePage() {
                 >
                   <div className="upload-content">
                     <Upload className="upload-icon" size={24} />
-                    <div className="upload-text">{imagePreview ? '点击重新选择截图' : '上传招聘截图'}</div>
+                    <div className="upload-text">{imagePreview ? '点击重新选择截图' : '上传图片'}</div>
                     <div className="upload-hint">支持PNG、JPG,截图中的岗位信息会被自动识别</div>
                   </div>
                   <input
@@ -1581,20 +1587,24 @@ export default function HomePage() {
 
                 <div className="source-section">
                   <div className="source-label">
-                    信息来源<span className="source-optional">（可选, 默认其他）</span>
+                    信息来源<span className="source-required">*</span>
                   </div>
                   <div className="source-desc">选择这条信息的来源渠道,便于后续分类和筛选</div>
                   <div className="source-chips">
                     {sourceOptions.map((ch) => (
                       <div
                         key={ch}
-                        className={`source-chip ${sourceChannel === ch ? 'active' : ''}`}
+                        className={`source-chip ${sourceChannels.includes(ch) ? 'active' : ''}`}
                         onClick={() => {
-                          setSourceChannel(ch);
+                          setSourceChannels((prev) =>
+                            prev.includes(ch)
+                              ? prev.filter((c) => c !== ch)
+                              : [...prev, ch]
+                          );
                           setSourceError('');
                         }}
                       >
-                        {sourceChannel === ch && <Check size={14} />}
+                        {sourceChannels.includes(ch) && <Check size={14} />}
                         {ch}
                       </div>
                     ))}
@@ -1780,12 +1790,26 @@ export default function HomePage() {
                     const isDeferred = /暂缓|可以暂缓/.test(item.reason);
                     const isUrgent = /DDL|ddl|截止|紧迫|紧急|尽快/.test(item.reason);
                     if (isDeferred && !showDeferred) return null;
+                    const isCompleted = completedPlanIndices.has(idx);
                     return (
                       <div
                         key={idx}
-                        className={`plan-item ${isUrgent ? 'urgent' : ''} ${isDeferred ? 'deferred' : ''}`}
+                        className={`plan-item ${isUrgent ? 'urgent' : ''} ${isDeferred ? 'deferred' : ''} ${isCompleted ? 'completed' : ''}`}
                       >
-                        <div className="plan-item-index">{idx + 1}</div>
+                        <button
+                          className="plan-item-toggle"
+                          onClick={() => {
+                            setCompletedPlanIndices((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(idx)) next.delete(idx);
+                              else next.add(idx);
+                              return next;
+                            });
+                          }}
+                          title={isCompleted ? '标记为未完成' : '标记为已完成'}
+                        >
+                          <CheckCircle size={18} />
+                        </button>
                         <div className="plan-item-body">
                           <div className="plan-item-header">
                             <span className="plan-item-company">{item.company}</span>
@@ -2007,9 +2031,10 @@ function BatchSelectionCard({
       <div className="candidate-list">
         {batchResult.candidates.map((candidate, idx) => {
           const isSelected = selectedIndices.includes(idx);
+          const limitReached = sf.application_limit != null && sf.application_limit > 0 && selectedIndices.length >= sf.application_limit && !isSelected;
           return (
-            <label key={idx} className={`candidate-item ${isSelected ? 'selected' : ''}`}>
-              <input type="checkbox" checked={isSelected} onChange={() => onToggle(idx)} className="candidate-checkbox" />
+            <label key={idx} className={`candidate-item ${isSelected ? 'selected' : ''} ${limitReached ? 'disabled' : ''}`}>
+              <input type="checkbox" checked={isSelected} onChange={() => onToggle(idx)} className="candidate-checkbox" disabled={limitReached} />
               <div className="candidate-info">
                 <div className="candidate-main">
                   <span className="candidate-position">{candidate.position}</span>
@@ -2211,6 +2236,13 @@ function parseRawTextSegments(rawText: string): Array<{ timestamp: string | null
   if (matches.length === 0) {
     segments.push({ timestamp: null, content: rawText });
   } else {
+    // 第一个时间戳之前的文本 (如首次创建记录时无时间戳的原始文本)
+    if (matches[0].index > 0) {
+      const beforeText = rawText.slice(0, matches[0].index).replace(/─{10,}/g, '').trim();
+      if (beforeText) {
+        segments.push({ timestamp: null, content: beforeText });
+      }
+    }
     for (let i = 0; i < matches.length; i++) {
       const start = matches[i].index;
       const end = i + 1 < matches.length ? matches[i + 1].index : rawText.length;
@@ -2369,18 +2401,6 @@ function HistoryCard({ record, onDelete, workspaceHeader }: { record: HistoryRec
             <div className="raw-block">
               <div className="raw-label"><FileText size={13} /> 原始输入图片</div>
               <div className="raw-image-placeholder">图片不可用</div>
-            </div>
-          )}
-          {record.source_url && (
-            <div className="raw-block">
-              <div className="raw-label"><ExternalLink size={13} /> 链接</div>
-              <a href={record.source_url} target="_blank" rel="noopener noreferrer" className="link">{record.source_url}</a>
-            </div>
-          )}
-          {record.todo && (
-            <div className="raw-block">
-              <div className="raw-label"><Target size={13} /> 待办</div>
-              <div>{record.todo}</div>
             </div>
           )}
           {rawTextSegments.length === 0 && !hasImage && <div className="muted-text">暂无原始输入记录</div>}

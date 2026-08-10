@@ -8,8 +8,8 @@
  *   备注(文本) | 来源链接(网页链接) | 优先级标记(单选) | 最后更新时间(自动)
  */
 
-import type { DingTalkRecord, ParsedJob } from './types';
-import { ESTIMATED_MINUTES_BY_STATUS } from './types';
+import type { DingTalkRecord, ParsedJob, PreUploadedAttachment } from './types';
+import { ESTIMATED_MINUTES_BY_STATUS, isWaitingTypeTodo } from './types';
 
 const APP_KEY = process.env.DEMO_DINGTALK_APP_KEY ?? '';
 const APP_SECRET = process.env.DEMO_DINGTALK_APP_SECRET ?? '';
@@ -461,7 +461,38 @@ async function uploadImageAttachment(
   return await attempt();
 }
 
+/**
+ * 预上传图片附件 (与 AI 解析并行执行, 避免串行等待)
+ * 返回附件对象, 后续通过 ParsedJob.preUploadedAttachment 传入 createRecord/updateRecord
+ */
+export async function preUploadImage(
+  base64Image: string,
+  config?: WorkspaceConfig
+): Promise<PreUploadedAttachment | null> {
+  try {
+    const token = await getAccessToken(config);
+    const operatorId = await getOperatorId(token, config);
+    const { baseId } = resolveIds(config);
+    const attachment = await uploadImageAttachment(token, baseId, operatorId, base64Image);
+    return attachment as PreUploadedAttachment | null;
+  } catch (err) {
+    console.warn('[钉钉] 预上传图片失败, 将在写入记录时重试:', err);
+    return null;
+  }
+}
+
 // ============== 字段构建 ==============
+
+/**
+ * 根据状态返回链接显示文案
+ */
+function getLinkLabel(status: string | null | undefined): string {
+  if (!status) return '报名链接';
+  if (status === '测评') return '测评链接';
+  if (status === '笔试') return '笔试链接';
+  if (['AI面', '群面', '一面', '二面', '三面', 'HR面'].includes(status)) return '面试链接';
+  return '报名链接';
+}
 
 /**
  * 根据 ParsedJob 构建钉钉表格字段
@@ -518,13 +549,16 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   if (parsed.todo) fields['待办'] = parsed.todo;
 
   // ---- 预计耗时 (数字) ----
-  // 按状态对照表强制同步: 有待办写对应值, 无待办写 null 清空旧值
+  // 规则: 预计耗时与待办严格绑定
+  // 1. 待办为空 → 预计耗时 = null (无需用户行动)
+  // 2. 待办为"等待结果"类 (如"一面结束, 等待下一步通知") → 预计耗时 = null (虽有待办但无需行动)
+  // 3. 待办为正常行动类 → 按状态对照表填写, 笔试优先用 AI 返回的真实时长
   if (parsed.status_hint && parsed.status_hint in ESTIMATED_MINUTES_BY_STATUS) {
-    if (parsed.todo) {
+    if (parsed.todo && !isWaitingTypeTodo(parsed.todo)) {
       const min = parsed.estimated_minutes ?? ESTIMATED_MINUTES_BY_STATUS[parsed.status_hint];
       fields['预计耗时'] = min != null ? Number(min) : null;
     } else {
-      // 无待办 → 清空旧值 (已投递/Offer/已挂等状态)
+      // 无待办 或 等待型待办 → 清空旧值
       fields['预计耗时'] = null;
     }
   }
@@ -534,7 +568,7 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
     const cleanedUrl = cleanedUrlString(parsed.source_url);
     if (cleanedUrl) {
       fields['链接'] = {
-        text: '报名链接',
+        text: getLinkLabel(parsed.status_hint),
         link: cleanedUrl,
       };
     }
@@ -551,8 +585,9 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   }
 
   // ---- 原始输入文本 ----
+  // 首次创建时加时间戳, 确保与追加逻辑格式一致 (updateRecord 的追加逻辑会覆盖此值)
   if (parsed.raw_text && parsed.raw_text.trim() !== '') {
-    fields['原始输入文本'] = parsed.raw_text.trim();
+    fields['原始输入文本'] = formatRawTextEntry(parsed.raw_text.trim());
   }
 
   // ---- 原始输入图片 ----
@@ -697,9 +732,9 @@ export async function createRecord(parsed: ParsedJob, config?: WorkspaceConfig):
 
   const fields = buildFields(parsed);
 
-  // 写入原始输入图片 (附件字段: 通过钉钉资源上传 API 上传, 失败时跳过)
+  // 写入原始输入图片 (附件字段: 优先使用预上传结果, 否则现场上传, 失败时跳过)
   if (parsed.raw_image && parsed.raw_image.trim()) {
-    const attachment = await uploadImageAttachment(token, baseId, operatorId, parsed.raw_image);
+    const attachment = parsed.preUploadedAttachment ?? await uploadImageAttachment(token, baseId, operatorId, parsed.raw_image);
     if (attachment) {
       fields['原始输入图片'] = [attachment];
       console.log('[钉钉] 图片附件已添加到字段');
@@ -781,6 +816,25 @@ export async function updateRecord(
     fields = filtered;
   }
 
+  // 状态冲突处理: 当状态发生变化时, 在备注中保留历史状态记录
+  if (existingRecord && parsed.status_hint) {
+    const oldStatus = existingRecord.fields?.['状态'];
+    const newStatus = parsed.status_hint;
+    if (oldStatus && oldStatus !== newStatus) {
+      const timestamp = new Date().toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      const statusHistory = `[${timestamp} 状态变更: ${oldStatus} → ${newStatus}]`;
+      const existingRemark = String(existingRecord.fields?.['备注'] ?? '');
+      // 合并: AI 返回的新备注 + 历史状态记录
+      const newRemark = parsed.remark
+        ? `${parsed.remark}\n${statusHistory}`
+        : existingRemark
+          ? `${existingRemark}\n${statusHistory}`
+          : statusHistory;
+      fields['备注'] = newRemark;
+      console.log(`[状态变更] ${oldStatus} → ${newStatus}, 已记录到备注`);
+    }
+  }
+
   // 追加原始输入文本 (保留历史, 不覆盖)
   if (existingRecord && parsed.raw_text) {
     const existingRaw = String(existingRecord.fields['原始输入文本'] ?? '');
@@ -793,9 +847,9 @@ export async function updateRecord(
     }
   }
 
-  // 写入原始输入图片 (附件字段: 通过钉钉资源上传 API 上传, 失败时跳过)
+  // 写入原始输入图片 (附件字段: 优先使用预上传结果, 否则现场上传, 失败时跳过)
   if (parsed.raw_image && parsed.raw_image.trim()) {
-    const attachment = await uploadImageAttachment(token, baseId, operatorId, parsed.raw_image);
+    const attachment = parsed.preUploadedAttachment ?? await uploadImageAttachment(token, baseId, operatorId, parsed.raw_image);
     if (attachment) {
       // 已有图片附件时, 追加新附件到数组; 相同图片不重复追加
       const existingAttachments = existingRecord?.fields?.['原始输入图片'];
@@ -886,7 +940,22 @@ export async function matchRecord(
   }
 
   // 无岗位编号时, 回退到模糊匹配
-  return aiMatchRecord(parsed.match_key, existingRecords);
+  const matched = await aiMatchRecord(parsed.match_key, existingRecords);
+  if (matched) return matched;
+
+  // 最终回退: 原始文本完全一致匹配 (防止 AI 返回不同岗位名导致重复创建)
+  if (parsed.raw_text) {
+    const rawTextLower = parsed.raw_text.trim().toLowerCase();
+    for (const record of existingRecords) {
+      const existingRaw = String(record.fields?.['原始输入文本'] ?? '').toLowerCase();
+      if (existingRaw.includes(rawTextLower) || rawTextLower.includes(existingRaw)) {
+        console.log(`[匹配成功] 原始文本匹配: recordId=${record.recordId}`);
+        return record;
+      }
+    }
+  }
+
+  return null;
 }
 
 export async function aiMatchRecord(
@@ -942,8 +1011,16 @@ function simpleFuzzyMatch(
       );
 
       if (companyMatch && positionMatch) {
-        console.log(`  [匹配成功] 优先级1 (公司+岗位): recordId=${record.recordId}`);
+        console.log(`  [匹配成功] 优先级1 (公司+岗位精确): recordId=${record.recordId}`);
         return record;
+      }
+      // 岗位名包含匹配 (如 "X-STAR" vs "X-STAR顶尖AI人才计划")
+      if (companyMatch && keyPosition && position) {
+        const containsMatch = position.includes(keyPosition) || keyPosition.includes(position);
+        if (containsMatch && keyPosition.length >= 3) {
+          console.log(`  [匹配成功] 优先级1.5 (公司+岗位包含): recordId=${record.recordId}, "${position}" vs "${keyPosition}"`);
+          return record;
+        }
       }
     }
   } else {

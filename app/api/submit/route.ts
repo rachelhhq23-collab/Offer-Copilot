@@ -3,8 +3,8 @@
  *
  * 完整流程:
  *   1. 接收用户提交内容 (文本 / 图片)
- *   2. AI 解析 → 自动判断 single / batch
- *   3. single: 规则校验 → 查询钉钉 → 匹配 → 新增/更新
+ *   2. AI 解析 + 钉钉记录查询 + 图片上传 (三者并行)
+ *   3. single: 规则校验 → 匹配 → 新增/更新
  *   4. batch: 返回候选项, 但如果只有1个candidate则自动按single处理
  */
 
@@ -16,6 +16,7 @@ import {
   matchRecord,
   createRecord,
   updateRecord,
+  preUploadImage,
   type WorkspaceConfig,
 } from '@/lib/dingtalk';
 import type {
@@ -24,17 +25,10 @@ import type {
   ParsedJob,
   BatchParsedResult,
   DingTalkRecord,
+  PreUploadedAttachment,
 } from '@/lib/types';
 
 export const runtime = 'nodejs';
-
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '10mb',
-    },
-  },
-};
 
 export async function POST(request: Request) {
   try {
@@ -65,17 +59,28 @@ export async function POST(request: Request) {
       );
     }
 
-    // ========== AI 解析 ==========
-    const { message_type, data } = await parseJob({
-      content: body.content,
-      image: body.image,
-      forceType: body.inputType,
-      deepseekKey,
-      qwenKey,
-      demoMode,
-    });
+    // ========== 并行执行: AI解析 + 查询已有记录 + 图片预上传 ==========
+    // 三者无依赖关系, 并行执行可节省 0.5-2.5s
+    const [parseResult, existingRecords, preUploadedAttachment] = await Promise.all([
+      parseJob({
+        content: body.content,
+        image: body.image,
+        forceType: body.inputType,
+        deepseekKey,
+        qwenKey,
+        demoMode,
+      }),
+      // 预查询记录: 失败时返回 null, processSingleJob 中会重试
+      fetchAllRecords(workspace).catch((err) => {
+        console.warn('[submit] 预查询记录失败, 将在 single 流程中重试:', err);
+        return null;
+      }),
+      // 预上传图片: 仅图片输入时执行, 失败时返回 null (后续 createRecord/updateRecord 会重试)
+      body.image ? preUploadImage(body.image, workspace) : Promise.resolve(null),
+    ]);
 
-    console.log(`[submit] AI 解析完成, 消息类型: ${message_type}`);
+    const { message_type, data } = parseResult;
+    console.log(`[submit] AI 解析完成, 消息类型: ${message_type}, 预查询记录: ${existingRecords?.length ?? '失败'} 条, 图片预上传: ${preUploadedAttachment ? '成功' : '未执行/失败'}`);
 
     // ========== batch 单候选自动转 single ==========
     if (message_type === 'batch') {
@@ -109,7 +114,7 @@ export async function POST(request: Request) {
           raw_image: null,
         };
 
-        return processSingleJob(autoJob, workspace);
+        return processSingleJob(autoJob, workspace, existingRecords, null);
       }
 
       console.log(`[submit] 批量模式, 共 ${batchData.candidates.length} 个候选项`);
@@ -136,7 +141,8 @@ export async function POST(request: Request) {
       parsed.raw_text = null;
     }
     parsed.raw_image = body.image ?? null; // base64 图片, 将在 createRecord/updateRecord 中上传到钉钉
-    return processSingleJob(parsed, workspace);
+    parsed.preUploadedAttachment = preUploadedAttachment;
+    return processSingleJob(parsed, workspace, existingRecords, preUploadedAttachment);
   } catch (error) {
     console.error('[submit] 处理异常:', error);
     const msg = error instanceof Error ? error.message : '未知错误';
@@ -149,8 +155,15 @@ export async function POST(request: Request) {
 
 /**
  * 处理单个岗位的完整流程
+ * @param existingRecords 预查询的已有记录 (null 表示预查询失败, 需要重新查询)
+ * @param preUploadedAttachment 预上传的图片附件 (null 表示无图片或预上传失败)
  */
-async function processSingleJob(parsed: ParsedJob, workspace?: WorkspaceConfig) {
+async function processSingleJob(
+  parsed: ParsedJob,
+  workspace?: WorkspaceConfig,
+  existingRecords?: DingTalkRecord[] | null,
+  preUploadedAttachment?: PreUploadedAttachment | null,
+) {
   console.log('[submit] single 模式, 开始校验和匹配');
 
   const validation = validateParsedJob(parsed);
@@ -163,10 +176,15 @@ async function processSingleJob(parsed: ParsedJob, workspace?: WorkspaceConfig) 
   }
 
   const cleaned: ParsedJob = validation.cleaned;
+  // 透传预上传的图片附件
+  if (preUploadedAttachment) {
+    cleaned.preUploadedAttachment = preUploadedAttachment;
+  }
   console.log('[submit] 校验后数据:', cleaned);
 
-  const existingRecords = await fetchAllRecords(workspace);
-  const matched = await matchRecord(cleaned, existingRecords);
+  // 使用预查询结果, 或在预查询失败时重新查询
+  const records = existingRecords ?? await fetchAllRecords(workspace);
+  const matched = await matchRecord(cleaned, records);
 
   let action: 'created' | 'updated';
   let record: DingTalkRecord;

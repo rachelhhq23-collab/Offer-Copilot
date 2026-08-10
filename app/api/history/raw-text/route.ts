@@ -44,6 +44,13 @@ function parseRawTextSegments(rawText: string): Array<{ timestamp: string; conte
   }
 
   const segments: Array<{ timestamp: string; content: string }> = [];
+  // 第一个时间戳之前的文本 (如首次创建记录时无时间戳的原始文本)
+  if (matches[0].index > 0) {
+    const beforeText = rawText.slice(0, matches[0].index).replace(/─{10,}/g, '').trim();
+    if (beforeText) {
+      segments.push({ timestamp: '', content: beforeText });
+    }
+  }
   for (let i = 0; i < matches.length; i++) {
     const start = matches[i].index;
     const end = i + 1 < matches.length ? matches[i + 1].index : rawText.length;

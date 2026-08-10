@@ -8,8 +8,10 @@ import {
   VALID_STATUSES,
   VALID_PRIORITIES,
   VALID_CITIES,
+  ESTIMATED_MINUTES_BY_STATUS,
   type ParsedJob,
 } from './types';
+import { isWaitingTypeTodo } from './types';
 
 export interface ValidationResult {
   valid: boolean;
@@ -144,9 +146,17 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
   }
 
   // ---- 规则 12: job_code 清理 ----
+  // 纯数字且≤4位的 job_code 极可能是URL参数(如 id=102), 不是真正的岗位编号
   if (cleaned.job_code !== undefined && cleaned.job_code !== null) {
     const code = cleaned.job_code.toString().trim();
-    cleaned.job_code = code === '' ? null : code;
+    if (code === '') {
+      cleaned.job_code = null;
+    } else if (/^\d{1,4}$/.test(code)) {
+      console.warn(`[校验] job_code "${code}" 疑似URL参数, 置为 null`);
+      cleaned.job_code = null;
+    } else {
+      cleaned.job_code = code;
+    }
   }
 
   // ---- 规则 13: application_limit 转为整数 ----
@@ -174,6 +184,30 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
 }
 
 function recalculatePriority(data: ParsedJob): string | null {
+  // 行动型状态 (需要用户做事的) 的基础优先级由状态决定, DDL只能提升不能降低
+  const actionStatuses = ['待投递', '测评', '笔试', 'AI面', '群面', '一面', '二面', '三面', 'HR面'];
+  const isActionStatus = data.status_hint && actionStatuses.includes(data.status_hint);
+  const isWaiting = isWaitingTypeTodo(data.todo);
+
+  // 等待型待办 → 低优先级, 不受DDL影响
+  if (isWaiting) {
+    return '低';
+  }
+
+  // 行动型状态: 保留状态对应的优先级, DDL只能提升
+  // 注意: 状态本身为行动型即可, 不要求 todo 非空 (AI 偶尔会漏填 todo 但状态是对的)
+  if (isActionStatus) {
+    const ddlPriority = calcDdlPriority(data);
+    // 高 > 中 > 低, 只取更高的
+    const statusPriority = '高'; // 行动型状态都是高优先级
+    return priorityHigher(statusPriority, ddlPriority) ? statusPriority : ddlPriority;
+  }
+
+  // 非行动型状态: 完全由DDL决定
+  return calcDdlPriority(data);
+}
+
+function calcDdlPriority(data: ParsedJob): string {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
 
@@ -208,6 +242,11 @@ function recalculatePriority(data: ParsedJob): string | null {
   if (diffDays <= 7) return '高';
   if (diffDays <= 30) return '中';
   return '低';
+}
+
+function priorityHigher(a: string, b: string): boolean {
+  const order: Record<string, number> = { '高': 3, '中': 2, '低': 1, '暂缓': 0 };
+  return (order[a] ?? 0) >= (order[b] ?? 0);
 }
 
 function isValidDate(str: string): boolean {
