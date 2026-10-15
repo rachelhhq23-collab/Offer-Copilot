@@ -4,7 +4,7 @@
  * 用户勾选岗位后调用:
  *   1. 对每个被选中的 candidate, 合并 shared_fields
  *   2. 动态生成待办 (包含内推码、投递入口等信息)
- *   3. 复用校验和匹配逻辑, 支持岗位编号精确匹配
+ *   3. 复用校验和匹配逻辑
  */
 
 import { NextResponse } from 'next/server';
@@ -25,6 +25,7 @@ import type {
 } from '@/lib/types';
 
 export const runtime = 'nodejs';
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
@@ -55,16 +56,6 @@ export async function POST(request: Request) {
 
     const existingRecords = await fetchAllRecords(workspace);
 
-    // 占位文本清理函数 (所有候选共用)
-    const cleanPlaceholder = (v: string | null | undefined): string | null => {
-      if (!v) return null;
-      const t = v.trim();
-      if (!t) return null;
-      if (/^(暂无|无|未知|没有|未提及|不[详用])/.test(t)) return null;
-      if (/^暂无.*(描述|要求|信息|岗位)/.test(t)) return null;
-      return t;
-    };
-
     // 并行处理所有选中的候选岗位 (各岗位互相独立, 无需串行)
     const results = await Promise.all(
       selected_indices.map(async (index): Promise<BatchSubmitResponse['results'][number] | null> => {
@@ -78,11 +69,8 @@ export async function POST(request: Request) {
           message_type: 'single',
           company: batch_result.source_company,
           position: candidate.position,
-          job_code: candidate.job_code,
           city: sf.city,
           deadline: sf.deadline,
-          description: cleanPlaceholder(candidate.description),
-          requirements: cleanPlaceholder(candidate.requirements) ?? cleanPlaceholder(sf.requirements),
           application_limit: sf.application_limit,
           referral_code: sf.referral_code,
           status_hint: '待投递',
@@ -90,7 +78,7 @@ export async function POST(request: Request) {
           estimated_minutes: todo ? 20 : null,
           match_key: `${batch_result.source_company}-${candidate.position}`,
           source_url: sf.source_link,
-          priority: '中',
+          echelon: body.echelon ?? null,
           source_channel: body.source_channel ?? null,
           raw_text: rawContent.trim() || (rawImage ? `[图片提交] AI 已识别: 公司=${batch_result.source_company}, 岗位=${candidate.position}` : null),
           raw_image: rawImage || null,

@@ -248,11 +248,10 @@ function parseDingTalkRecord(record: DingTalkRecord): HistoryRecord {
     recordId: record.recordId,
     company: extractText(f['公司']),
     position: extractText(f['岗位']),
-    job_code: f['岗位编号'] ? extractText(f['岗位编号']) : null,
     city: cities,
     deadline,
     status: extractText(f['状态']) || '待投递',
-    priority: f['优先级标记'] ? extractText(f['优先级标记']) : null,
+
     last_updated_time: lastUpdated,
     raw_text: f['原始输入文本'] ? extractText(f['原始输入文本']) : null,
     raw_image: extractAttachmentUrl(f['原始输入图片']),
@@ -260,6 +259,7 @@ function parseDingTalkRecord(record: DingTalkRecord): HistoryRecord {
     todo: f['待办'] ? extractText(f['待办']) : null,
     referral_code: f['内推码'] ? extractText(f['内推码']) : null,
     source_url: sourceUrl,
+    info_session: f['宣讲会行程'] ? extractText(f['宣讲会行程']) : null,
     _raw_fields: f,
   };
 }

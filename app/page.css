@@ -1849,22 +1849,23 @@
   background: rgba(255, 255, 255, 0.3);
 }
 
-.candidate-code {
-  display: inline-block;
-  padding: 2px 8px;
-  background: var(--color-bg-subtle);
-  color: var(--color-text-tertiary);
-  border-radius: 4px;
-  font-size: 12px;
-  font-family: inherit;
-}
-
 .referral-tag {
   display: inline-flex;
   align-items: center;
   padding: 2px 8px;
   background: var(--color-warning-light);
   color: var(--color-warning);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.info-session-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: var(--color-primary-light, #e8f0fe);
+  color: var(--color-primary, #1e3a5f);
   border-radius: 4px;
   font-size: 12px;
   font-weight: 500;
@@ -1997,12 +1998,6 @@
   font-size: 14px;
   font-weight: 600;
   color: var(--color-text);
-}
-
-.candidate-requirements {
-  font-size: 13px;
-  color: var(--color-text-tertiary);
-  line-height: 1.5;
 }
 
 .batch-confirm {

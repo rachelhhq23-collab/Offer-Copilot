@@ -5,13 +5,12 @@
  */
 
 import {
-  VALID_STATUSES,
-  VALID_PRIORITIES,
   VALID_CITIES,
   ESTIMATED_MINUTES_BY_STATUS,
+  isWaitingTypeTodo,
+  normalizeStatus,
   type ParsedJob,
 } from './types';
-import { isWaitingTypeTodo } from './types';
 
 export interface ValidationResult {
   valid: boolean;
@@ -43,39 +42,51 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
     }
   }
 
-  // ---- 规则 3: status_hint 兜底 ----
-  if (!cleaned.status_hint || !VALID_STATUSES.includes(cleaned.status_hint as any)) {
+  // ---- 规则 3: status_hint 归一化 + 兜底 ----
+  // 先归一化变体 (如"待测评""在线测评"→"测评"), 无法识别才兜底为"待投递",
+  // 否则进展更新消息的状态会被错误重置, 导致状态无法流转
+  const normalizedStatus = normalizeStatus(cleaned.status_hint);
+  if (!normalizedStatus) {
     if (cleaned.status_hint) {
-      console.warn(`[校验] status_hint 无效, 兜底为"待投递": ${cleaned.status_hint}`);
+      console.warn(`[校验] status_hint 无法识别, 兜底为"待投递": ${cleaned.status_hint}`);
     }
     cleaned.status_hint = '待投递';
+  } else if (cleaned.status_hint !== normalizedStatus) {
+    console.log(`[校验] status_hint 归一化: "${cleaned.status_hint}" → "${normalizedStatus}"`);
+    cleaned.status_hint = normalizedStatus;
   }
 
   // ---- 规则 4: estimated_minutes 校验 ----
-  // 如果 todo 为 null, estimated_minutes 必须强制为 null
+  // 与状态、待办严格对齐:
+  //   1. todo 为空 → 强制 null
+  //   2. 等待型待办 (无需行动) → 强制 null
+  //   3. 行动型待办 → 优先按状态对照表, AI 返回值仅用于笔试特殊时长(90分钟等)
+  const statusForMin = cleaned.status_hint;
+  const isWaitTodo = isWaitingTypeTodo(cleaned.todo, statusForMin);
   if (!cleaned.todo || cleaned.todo.trim() === '') {
     cleaned.todo = null;
     cleaned.estimated_minutes = null;
+  } else if (isWaitTodo) {
+    // 等待型 todo 虽然非空, 但用户无需行动 → 预计耗时 null (与 ai-parser/dingtalk 保持一致)
+    cleaned.estimated_minutes = null;
   } else {
-    const minutes = Number(cleaned.estimated_minutes);
-    if (isNaN(minutes) || minutes < 5 || minutes > 480) {
-      console.warn(`[校验] estimated_minutes 超出范围, 兜底为 30: ${cleaned.estimated_minutes}`);
-      cleaned.estimated_minutes = 30;
+    const defaultMin = statusForMin ? (ESTIMATED_MINUTES_BY_STATUS[statusForMin] ?? null) : null;
+    const aiMinutes = cleaned.estimated_minutes;
+    if (statusForMin === '笔试' && aiMinutes !== null && aiMinutes !== undefined) {
+      const n = Number(aiMinutes);
+      if (!isNaN(n) && n >= 5 && n <= 480) {
+        // 笔试且 AI 返回了非默认时长 (如 90 分钟), 保留真实值
+        cleaned.estimated_minutes = n;
+      } else {
+        cleaned.estimated_minutes = defaultMin;
+      }
     } else {
-      cleaned.estimated_minutes = minutes;
+      // 其他状态一律使用对照表, 忽略 AI 返回的异常值 (不再固定兜底 30)
+      cleaned.estimated_minutes = defaultMin;
     }
   }
 
-  // ---- 规则 5: requirements / description 清理 ----
-  // AI 可能返回 "暂无"、"暂无岗位要求描述"、"无" 等占位文本, 统一置为 null
-  if (isPlaceholderText(cleaned.requirements)) {
-    cleaned.requirements = null;
-  }
-  if (isPlaceholderText(cleaned.description)) {
-    cleaned.description = null;
-  }
-
-  // ---- 规则 6: match_key 兜底生成 ----
+  // ---- 规则 5: match_key 兜底生成 ----
   if (!cleaned.match_key || cleaned.match_key.trim() === '') {
     const parts: string[] = [];
     if (cleaned.company) parts.push(cleaned.company);
@@ -83,13 +94,7 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
     cleaned.match_key = parts.join('-') || '未知岗位';
   }
 
-  // ---- 规则 7: priority 校验 ----
-  if (cleaned.priority && !VALID_PRIORITIES.includes(cleaned.priority as any)) {
-    console.warn(`[校验] priority 无效, 兜底为"中": ${cleaned.priority}`);
-    cleaned.priority = '中';
-  }
-
-  // ---- 规则 8: source_url 格式校验 ----
+  // ---- 规则 6: source_url 格式校验 ----
   if (cleaned.source_url && cleaned.source_url.trim() !== '') {
     let url = cleaned.source_url
       .replace(/`/g, '')
@@ -109,7 +114,7 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
     cleaned.source_url = null;
   }
 
-  // ---- 规则 9: city 数组校验 (多选字段) ----
+  // ---- 规则 8: city 数组校验 (多选字段) ----
   if (!cleaned.city || cleaned.city.length === 0) {
     cleaned.city = ['未知'];
   } else {
@@ -122,7 +127,7 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
     if (cleaned.city.length === 0) cleaned.city = ['未知'];
   }
 
-  // ---- 规则 10: locations 中日期格式校验 ----
+  // ---- 规则 9: locations 中日期格式校验 ----
   if (cleaned.locations && Array.isArray(cleaned.locations)) {
     cleaned.locations = cleaned.locations
       .filter((loc) => loc.city && loc.city.trim() !== '')
@@ -139,27 +144,7 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
     cleaned.locations = [];
   }
 
-  // ---- 规则 11: 基于实际日期重算优先级 ----
-  const recalculatedPriority = recalculatePriority(cleaned);
-  if (recalculatedPriority && recalculatedPriority !== cleaned.priority) {
-    cleaned.priority = recalculatedPriority;
-  }
-
-  // ---- 规则 12: job_code 清理 ----
-  // 纯数字且≤4位的 job_code 极可能是URL参数(如 id=102), 不是真正的岗位编号
-  if (cleaned.job_code !== undefined && cleaned.job_code !== null) {
-    const code = cleaned.job_code.toString().trim();
-    if (code === '') {
-      cleaned.job_code = null;
-    } else if (/^\d{1,4}$/.test(code)) {
-      console.warn(`[校验] job_code "${code}" 疑似URL参数, 置为 null`);
-      cleaned.job_code = null;
-    } else {
-      cleaned.job_code = code;
-    }
-  }
-
-  // ---- 规则 13: application_limit 转为整数 ----
+  // ---- 规则 11: application_limit 转为整数 ----
   if (cleaned.application_limit !== undefined && cleaned.application_limit !== null) {
     const n = Number(cleaned.application_limit);
     if (isNaN(n)) {
@@ -169,84 +154,18 @@ export function validateParsedJob(raw: ParsedJob): ValidationResult {
     }
   }
 
-  // ---- 规则 14: referral_code 清理 ----
+  // ---- 规则 12: referral_code 清理 ----
   if (cleaned.referral_code !== undefined && cleaned.referral_code !== null) {
     const code = cleaned.referral_code.toString().trim();
     cleaned.referral_code = code === '' ? null : code;
   }
 
-  // ---- 规则 15: remark 清理 ----
+  // ---- 规则 13: remark 清理 ----
   if (isPlaceholderText(cleaned.remark)) {
     cleaned.remark = null;
   }
 
   return { valid: true, errors, cleaned };
-}
-
-function recalculatePriority(data: ParsedJob): string | null {
-  // 行动型状态 (需要用户做事的) 的基础优先级由状态决定, DDL只能提升不能降低
-  const actionStatuses = ['待投递', '测评', '笔试', 'AI面', '群面', '一面', '二面', '三面', 'HR面'];
-  const isActionStatus = data.status_hint && actionStatuses.includes(data.status_hint);
-  const isWaiting = isWaitingTypeTodo(data.todo);
-
-  // 等待型待办 → 低优先级, 不受DDL影响
-  if (isWaiting) {
-    return '低';
-  }
-
-  // 行动型状态: 保留状态对应的优先级, DDL只能提升
-  // 注意: 状态本身为行动型即可, 不要求 todo 非空 (AI 偶尔会漏填 todo 但状态是对的)
-  if (isActionStatus) {
-    const ddlPriority = calcDdlPriority(data);
-    // 高 > 中 > 低, 只取更高的
-    const statusPriority = '高'; // 行动型状态都是高优先级
-    return priorityHigher(statusPriority, ddlPriority) ? statusPriority : ddlPriority;
-  }
-
-  // 非行动型状态: 完全由DDL决定
-  return calcDdlPriority(data);
-}
-
-function calcDdlPriority(data: ParsedJob): string {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-
-  const allDates: string[] = [];
-  if (data.locations) {
-    for (const loc of data.locations) {
-      if (loc.date && isValidDate(loc.date)) {
-        allDates.push(loc.date);
-      }
-    }
-  }
-  if (data.deadline && isValidDate(data.deadline)) {
-    allDates.push(data.deadline);
-  }
-
-  if (allDates.length === 0) {
-    return data.company || data.position ? '低' : '暂缓';
-  }
-
-  const upcomingDates = allDates
-    .map((d) => new Date(d + 'T00:00:00+08:00'))
-    .filter((d) => d.getTime() >= now.getTime())
-    .sort((a, b) => a.getTime() - b.getTime());
-
-  if (upcomingDates.length === 0) return '暂缓';
-
-  const nearestDate = upcomingDates[0];
-  const diffDays = Math.ceil(
-    (nearestDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
-  );
-
-  if (diffDays <= 7) return '高';
-  if (diffDays <= 30) return '中';
-  return '低';
-}
-
-function priorityHigher(a: string, b: string): boolean {
-  const order: Record<string, number> = { '高': 3, '中': 2, '低': 1, '暂缓': 0 };
-  return (order[a] ?? 0) >= (order[b] ?? 0);
 }
 
 function isValidDate(str: string): boolean {
@@ -271,7 +190,7 @@ function isValidUrl(str: string): boolean {
 }
 
 /**
- * 检测 AI 返回的占位文本 (如 "暂无", "暂无岗位要求描述", "无" 等)
+ * 检测 AI 返回的占位文本 (如 "暂无", "无", "未知" 等)
  * 这些不是真正的业务数据, 应该置为 null
  */
 function isPlaceholderText(value: string | null | undefined): boolean {

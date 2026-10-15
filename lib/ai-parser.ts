@@ -13,7 +13,7 @@ import type {
   MessageType,
   BatchSharedFields,
 } from './types';
-import { ESTIMATED_MINUTES_BY_STATUS, isWaitingTypeTodo } from './types';
+import { ESTIMATED_MINUTES_BY_STATUS, isWaitingTypeTodo, normalizeStatus } from './types';
 
 // ============== 环境变量 (仅演示模式使用) ==============
 
@@ -35,8 +35,11 @@ export interface AIConfig {
   demoMode?: boolean;
 }
 
-const TEXT_TIMEOUT = 15000;
-const IMAGE_TIMEOUT = 60000;
+// Vercel Hobby 函数硬上限 10s: AI 解析之后还要串行执行钉钉写入 (token 已缓存,
+// 典型 1-2s), 因此 AI 超时设 5.5s (图片 6s), 超时后仍有 ~4.5s 用于返回/写入,
+// 避免"AI 占满 7s + 写入 3s"超过 10s 被 Vercel 强杀成 504 空响应
+const TEXT_TIMEOUT = 5500;
+const IMAGE_TIMEOUT = 6000;
 
 // ============== System Prompt ==============
 
@@ -45,122 +48,38 @@ function buildSystemPrompt(): string {
   const todayStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
   const year = today.getFullYear();
 
-  return `你是一个招聘信息解析器。用户会提交一段招聘通知内容, 可能是文字、图片或混合内容。
-当前日期是 ${todayStr}, 请基于当前日期判断年份和优先级。
+  return `招聘信息解析器。当前日期: ${todayStr}。处理完整招聘通知和简短进展更新(如"收到群面""DDL改为XXX")。进展更新只提取明确信息,其他填null,不编造。
 
-你需要处理两种输入场景:
-1. **完整招聘通知**: 包含公司、岗位、JD 等完整信息
-2. **简短进展更新**: 比如"大疆收到群面通知"、"百度DDL改为2026-09-30"、"美团内推码ABC123" 这类只有几个字段的更新
+message_type: 2个以上不同岗位名称或编号→batch; 岗位方向/类别(如"技术类""产品类")不算独立岗位,按single处理。
 
-对于"简短进展更新", 你需要:
-- 尽力提取公司名(必须)、岗位名(如有)、状态变化、待办、截止日期等明确信息
-- 其他未提及的字段一律填 null (不要编造)
-- match_key 必须包含公司名, 如果能识别岗位也要包含, 格式: "公司-岗位" 或 "公司"
-- 如果输入只是更新某个字段(如 DDL), 只提取那个字段即可
+城市(多选): 北京/上海/深圳/广州/杭州/成都/海外/其他/未知。没提到填["未知"]。
+状态(单选): 待投递/已投递/测评/笔试/AI面/群面/一面/二面/三面/HR面/Offer/已拒绝/简历挂/测评挂/笔试挂/面试挂/已挂。
+状态映射: "收到群面邀请/群面通知"→群面, "收到测评邀请/测评通知/邀您参加在线测评"→测评, "收到笔试邀请/笔试通知"→笔试, "已投递/网申成功"→已投递, "收到Offer"→Offer, "XX结束"→状态不变/待办填"XX结束,等待下一步通知", "XX完成"→状态不变/待办填"XX完成,等待结果"。status_hint 必须且只能从上一行枚举中选一个值原样填写, 严禁返回"待测评""在线测评""测评中"等任何变体。
 
-钉钉 AI 表格有以下 16 个字段, 你提取的信息必须和这些字段对齐:
-  公司(文本) | 岗位(文本) | 岗位编号(文本) | 城市(多选)
-  投递DDL(日期) | 岗位描述(文本) | 岗位要求(文本) | 投递数量限制(数字)
-  内推码(文本) | 状态(单选) | 待办(文本) | 预计耗时(数字)
-  备注(文本) | 来源链接(网页链接) | 优先级标记(单选) | 最后更新时间(自动)
+宣讲会行程(info_session)提取规则(重要):
+- 如果内容提到学校宣讲会/双选会/招聘会, 必须提取完整的时间+地点到 info_session 字段
+- 地点必须包含具体的教学楼和教室, 不能只写校区 (如"教3-201""学生活动中心301", 不能只写"下沙校区")
+- 格式: "日期+时间+教学楼+教室", 如"9月15日14:00 教3-201""9月20日19:00 学生活动中心301"
+- 没有宣讲会信息时填 null
 
-首先, 判断消息类型 (message_type):
-- 如果内容里能提取出 2 个或以上不同的岗位 (不同的岗位名称或不同的岗位编号), 判定为 "batch"
-- 如果只有 1 个明确的岗位, 判定为 "single"
+备注(remark)提取规则:
+- 只记录宣讲会以外的补充信息 (宣讲会信息已放入 info_session, 不要重复放入 remark)
+- 没有补充信息填 null
 
-城市字段是多选, 只能从以下选项中选择: 北京 / 上海 / 深圳 / 广州 / 杭州 / 成都 / 海外 / 其他 / 未知
-没提到就填 ["未知"], 提到多个就全部列出来。
+=== single ===
+{"message_type":"single","company":"公司名,null","position":"岗位名,null","city":["城市数组"],"deadline":"YYYY-MM-DD,null","application_limit":数字或null,"referral_code":"内推码,null","status_hint":"状态,默认待投递","todo":"下一步动作,纯资讯填null","estimated_minutes":"待投递=20,测评=60,笔试=60(原文有具体时长用真实值),面试类=120,结束状态/null=null","source_url":"与状态最相关的链接,不加反引号,null","priority":null,"info_session":"宣讲会行程或null","remark":"备注,null","match_key":"公司-岗位"}
 
-状态字段只能从以下选项中选择:
-  待投递 / 已投递 / 测评 / 笔试 / AI面 / 群面 / 一面 / 二面 / 三面 / HR面 / Offer / 已拒绝 / 简历挂 / 测评挂 / 笔试挂 / 面试挂 / 已挂
+=== batch ===
+{"message_type":"batch","source_company":"公司名","shared_fields":{"deadline":"YYYY-MM-DD,null","application_limit":数字或null,"referral_code":"内推码,null","source_link":"网申链接,null","city":["城市数组"]},"candidates":[{"position":"岗位名"}]}
 
-优先级标记只能从以下选项中选择: 高 / 中 / 低 / 暂缓
+要求: 只返回JSON不加解释 | 日期YYYY-MM-DD | 年份:提到2027用2027否则用${year} | 数字或null不用字符串 | 无法提取填null | 公司名用简称 | city始终数组 | 纯资讯todo填null | source_url不加反引号
 
-进展更新的状态语义映射 (当用户没明确说状态时, 从文字推断):
-- "收到群面"/"进入群面" → 状态: 群面, 待办: 待群面
-- "收到一面"/"进入一面" → 状态: 一面, 待办: 待一面
-- "收到测评"/"进入测评" → 状态: 测评, 待办: 待测评
-- "收到笔试"/"进入笔试" → 状态: 笔试, 待办: 待笔试
-- "已投递"/"已网申" → 状态: 已投递, 待办: 等待筛选结果
-- "收到Offer" → 状态: Offer, 待办: 确认Offer
-- "简历挂"/"测评挂"/"笔试挂"/"面试挂" → 对应挂状态, 待办: null
-- "DDL改为XXX"/"截止日期XXX" → 只更新 deadline 字段, 其他不变
-- "一面结束"/"二面结束"/"面试结束了" → 状态不变(保留原状态), 待办: "XX结束, 等待下一步通知"(例如"一面结束, 等待下一步通知")
-- "测评完成"/"笔试完成"/"已完成测评" → 状态不变, 待办: "测评完成, 等待结果" 或 "笔试完成, 等待结果"
-
-【优先级判断规则 - 必须严格遵守, 覆盖DDL距离判断】
-- 高优先级: 状态为"待投递""测评""笔试""AI面""群面""一面""二面""三面""HR面" (即需要用户采取行动的状态, 这类DDL通常在一周内)
-- 中优先级: 收到明确通知且DDL在7-30天
-- 低优先级: 状态为"已投递""Offer""已拒绝" 或 DDL在30天以上 (即已完成当前步骤, 等待结果的状态)
-- 暂缓: 所有场次都已过期, 或状态为"简历挂""测评挂""笔试挂""面试挂""已挂"
-
-=== 格式 A: single (单一岗位) ===
-{
-  "message_type": "single",
-  "company": "公司名称, 识别不到就填 null",
-  "position": "岗位名称, 识别不到就填 null",
-  "job_code": "岗位编号, 必须是消息正文中明确标注的岗位编号(如 J100665, A1024B), 没有就填 null。严禁从URL参数中提取id/pid等数字作为岗位编号",
-  "city": ["城市数组, 只能从预设选项中选, 没提到就填 ['未知']"],
-  "deadline": "格式 YYYY-MM-DD, 招满即止/不设截止就填 null",
-  "description": "岗位描述, 没有明确描述就填 null",
-  "requirements": "岗位要求摘要, 没有就填 null",
-  "application_limit": 投递数量限制的数字, 比如 '每人限投1个' 就填 1, 没提到就填 null,
-  "referral_code": "内推码, 没有就填 null",
-  "status_hint": "状态, 只能是预设选项之一, 默认 '待投递'",
-  "todo": "具体可执行的下一步动作, 必须包含关键信息(比如投递入口、内推码)。
-           如果消息本身没有要求用户做任何动作(纯资讯/祝贺类), 这里必须填 null, 不能编造",
-  "estimated_minutes": "数字。按 status_hint 对照表填写, 与状态严格对齐:
-                        待投递=20 (网申/投递简历),
-                        测评=60,
-                        笔试=60 (但如果消息原文明确写了具体时长, 比如"90分钟笔试""笔试时长2小时", 优先用消息里的真实值, 不用60),
-                        AI面/群面/一面/二面/三面/HR面=120,
-                        已投递/Offer/已拒绝/简历挂/测评挂/笔试挂/面试挂/已挂=null (流程已结束或无需用户行动)。
-                        如果 todo 为 null, 这里必须也是 null",
-  "source_url": "与当前状态最相关的链接。面试通知→填面试链接, 测评通知→填测评链接, 招聘信息→填网申/报名链接。不要填飞书下载等通用工具链接。没有就填 null, 不要加markdown反引号",
-  "priority": "优先级, 只能是预设选项之一。按状态优先判断(覆盖DDL距离):
-              - 高: 状态为待投递/测评/笔试/AI面/群面/一面/二面/三面/HR面 (需要用户采取行动的状态)
-              - 中: 状态为待投递但DDL在30天以上, 或DDL在7-30天
-              - 低: 状态为已投递/Offer/已拒绝, 或DDL在30天以上且无紧迫任务
-              - 暂缓: 所有场次都已过期, 或状态为简历挂/测评挂/笔试挂/面试挂/已挂",
-  "remark": "备注信息, 没有就填 null",
-  "match_key": "公司+岗位组合, 用于模糊匹配兜底"
-}
-
-=== 格式 B: batch (批量岗位列表) ===
-{
-  "message_type": "batch",
-  "source_company": "发消息的公司名称",
-  "shared_fields": {
-    "deadline": "整条消息共享的截止日期 YYYY-MM-DD, 没有就填 null",
-    "application_limit": 数字, 比如 '每人限投1个' 就填 1, 没有就填 null,
-    "referral_code": "整条消息共享的内推码, 没有就填 null",
-    "source_link": "网申入口链接, 没有就填 null",
-    "city": ["整条消息共享的城市数组, 没提到就填 ['未知']"],
-    "requirements": "整条消息共享的岗位要求(如学历、专业、面向对象等), 没有就填 null"
-  },
-  "candidates": [
-    {
-      "position": "具体岗位/职位名称",
-      "job_code": "该岗位单独的编号, 必须是正文明确标注的, 严禁从URL参数提取, 没有就填 null",
-      "description": "该岗位单独的描述, 没有就填 null",
-      "requirements": "该岗位的要求。如果消息有共享的学历/专业/面向对象等要求, 必须填入此处, 不能填 null"
-    }
-  ]
-}
-
-要求:
-1. 只返回 JSON, 不要有任何解释文字或 markdown 包裹
-2. 日期格式必须是 YYYY-MM-DD, 如 ${year}-08-15
-3. 日期年份: 如果消息中明确提到2027年, 则用2027; 否则默认用2026年
-4. estimated_minutes 和 application_limit 必须是数字或 null, 不能是字符串
-5. 如果某个字段无法从内容中提取, 使用 null
-6. match_key 中的公司名使用常用简称, 比如"腾讯科技"→"腾讯", "阿里巴巴"→"阿里"
-7. status_hint 和 priority 只能从指定选项中选择一个
-8. city 字段始终是数组, 即使只有一个城市也要用 ["北京"] 格式
-9. todo 字段: 如果消息没有要求用户做任何动作(比如祝贺、资讯类), 必须填 null
-10. batch 格式的 candidates 按消息里出现的顺序排列
-11. source_url / source_link 不要加 markdown 反引号
-12. batch 格式: 每个候选岗位的 requirements 必须填写。如果消息有共享的学历/专业/面向对象等要求, 每个岗位都要填入这些共享要求`;
+公司名识别规则(重要):
+- 纯链接输入时,公司名必须从网页标题/页面正文/域名中准确提取,严禁凭域名发音臆测
+- "公司名用简称"指使用企业官方简称(如"阿里巴巴""腾讯"),而非把陌生公司替换成发音相近的知名品牌
+- 域名发音相似不等于同一公司:aukeys=傲基科技(非奥克斯Aux),aux=奥克斯,bytedance=字节跳动,tencent=腾讯
+- 若仅凭链接无法确定公司全称,可保留域名中可识别的拼音部分作为公司名(如aukeys→傲基科技),但严禁替换成其他近似品牌
+- 当链接中含品牌拼音且与已知中文品牌发音相近时,优先采用域名拼音对应的真实公司,而非更知名的同音品牌`;
 }
 
 // ============== 工具 ==============
@@ -227,7 +146,6 @@ function parseJsonFromAi(
         rawShared.referral_code ?? parsed.referral_code ?? null,
       source_link: rawShared.source_link ?? parsed.source_link ?? null,
       city: normalizeCityArray(rawShared.city ?? parsed.city ?? ['未知']),
-      requirements: rawShared.requirements ?? parsed.requirements ?? null,
     };
 
     const data: BatchParsedResult = {
@@ -237,9 +155,6 @@ function parseJsonFromAi(
       candidates: Array.isArray(parsed.candidates)
         ? parsed.candidates.map((c: any) => ({
             position: c.position ?? '',
-            job_code: c.job_code ?? null,
-            description: c.description ?? null,
-            requirements: c.requirements ?? null,
           }))
         : [],
     };
@@ -248,7 +163,12 @@ function parseJsonFromAi(
     // single 格式
     const city = normalizeCityArray(parsed.city ?? ['未知']);
 
-    const status = parsed.status_hint ?? '待投递';
+    // 状态归一化: AI 可能返回"待测评""在线测评"等变体, 统一映射到标准枚举
+    // 不归一化会导致后续优先级/预计耗时/todo 补全全部按错误状态计算, validator 还会兜底为"待投递"
+    const status = normalizeStatus(parsed.status_hint) ?? '待投递';
+    if (parsed.status_hint && parsed.status_hint !== status) {
+      console.log(`[AI解析] 状态归一化: "${parsed.status_hint}" → "${status}"`);
+    }
     let todo = parsed.todo ?? null;
 
     // 行动型状态 AI 漏填 todo 时, 自动补充默认待办 (防止 AI 只写了状态没写 todo 导致优先级/预计耗时出错)
@@ -269,7 +189,7 @@ function parseJsonFromAi(
     }
 
     // 如果todo是"等待结果"类文本, 视为无需用户行动 → 清空estimated_minutes
-    const isNoActionTodo = isWaitingTypeTodo(todo);
+    const isNoActionTodo = isWaitingTypeTodo(todo, status);
 
     // 强制修正: 根据状态+待办类型重新计算 estimated_minutes, 确保与状态严格对齐
     let estimatedMinutes: number | null = null;
@@ -299,44 +219,20 @@ function parseJsonFromAi(
     }
     console.log(`[AI解析] match_key: "${matchKey}" (company="${company}", position="${position}")`);
 
-    // 优先级强制修正: 按状态驱动, 覆盖 AI 返回值
-    const highPriorityStatuses = [
-      '待投递', '测评', '笔试', 'AI面', '群面', '一面', '二面', '三面', 'HR面'
-    ];
-    const suspendedStatuses = ['简历挂', '测评挂', '笔试挂', '面试挂', '已挂'];
-    const lowPriorityStatuses = ['已投递', 'Offer', '已拒绝'];
-    let priority = parsed.priority ?? '中';
-    if (highPriorityStatuses.includes(status)) {
-      // 但如果是等待结果场景 (如"一面结束了等待结果", 状态还是"一面", 但实际已完成), 降为低
-      if (isNoActionTodo) {
-        priority = '低';
-      } else {
-        priority = '高';
-      }
-    } else if (suspendedStatuses.includes(status)) {
-      priority = '暂缓';
-    } else if (lowPriorityStatuses.includes(status)) {
-      priority = '低';
-    }
-    console.log(`[AI解析] 状态="${status}", todo="${todo ?? 'null'}" → 优先级修正为 "${priority}" (原始="${parsed.priority ?? '中'}")`);
-
     const data: ParsedJob = {
       message_type: 'single',
       company: parsed.company ?? null,
       position: parsed.position ?? null,
-      job_code: parsed.job_code ?? null,
       city,
       deadline: parsed.deadline ?? null,
-      description: parsed.description ?? null,
-      requirements: parsed.requirements ?? null,
       application_limit: parsed.application_limit ?? null,
       referral_code: parsed.referral_code ?? null,
-      status_hint: parsed.status_hint ?? '待投递',
+      status_hint: status,
       todo,
       estimated_minutes: estimatedMinutes,
       match_key: matchKey,
       source_url: resolveSourceUrl(parsed.source_url, status, rawText ?? ''),
-      priority,
+      info_session: parsed.info_session ?? null,
       remark: parsed.remark ?? null,
       locations: Array.isArray(parsed.locations) ? parsed.locations : [],
     };
@@ -468,6 +364,9 @@ async function parseTextWithDeepseek(
 
   const url = `${baseUrl}/chat/completions`;
 
+  const t0 = Date.now();
+  console.log(`[Deepseek] 开始请求, 超时=${TEXT_TIMEOUT}ms, 内容长度=${content.length}`);
+
   const res = await fetchWithTimeout(
     url,
     {
@@ -492,6 +391,8 @@ async function parseTextWithDeepseek(
     },
     TEXT_TIMEOUT
   );
+
+  console.log(`[Deepseek] 响应耗时: ${Date.now() - t0}ms, 状态: ${res.status}`);
 
   if (!res.ok) {
     const errText = await res.text();
@@ -563,10 +464,6 @@ function sanitizeImageResult(
       sf.deadline = null;
     }
 
-    // 没有截止日期时, 优先级降为低
-    if (!sf.deadline && batchData.candidates.length > 0) {
-      // priority 在 batch 中不存在, 无需处理
-    }
   } else {
     const jobData = data as ParsedJob;
 
@@ -582,10 +479,6 @@ function sanitizeImageResult(
       jobData.deadline = null;
     }
 
-    // 没有截止日期时, 优先级降为低
-    if (!jobData.deadline && jobData.priority !== '高') {
-      jobData.priority = '低';
-    }
   }
 
   return result;
@@ -609,9 +502,9 @@ const VISION_PROMPT = `请仔细识别这张图片中的所有文字内容, 然�
 - deadline: 只有图片明确写了截止日期/DDL/截止时间时才填写 YYYY-MM-DD, 没写就填 null, 严禁编造日期
 - referral_code: 只有图片明确写了内推码时才提取, 没有填 null
 - source_url: 只有图片明确有链接时才提取, 没有填 null
-- requirements: 只有图片明确写了学历/专业/面向对象等要求时才提取, 没有填 null
-- status_hint: 状态, 默认"待投递"
-- priority: 只有图片明确提到优先级(如急招/紧急)时才设为高, 没有截止日期时默认"低"
+- status_hint: 状态, 默认"待投递"; 只能从枚举中选一个原样填写: 待投递/已投递/测评/笔试/AI面/群面/一面/二面/三面/HR面/Offer/已拒绝/简历挂/测评挂/笔试挂/面试挂/已挂; 收到测评/笔试/面试通知时分别填 测评/笔试/对应面试阶段, 严禁返回"待测评"等变体
+- info_session: 宣讲会行程。如果图片中提到学校宣讲会/双选会/招聘会的时间或地点, 必须提取完整的时间+教学楼+教室(不能只写校区), 格式如"9月15日14:00 教3-201"; 无宣讲会信息填 null
+- remark: 备注字段。只记录宣讲会以外的补充信息(宣讲会信息已放入info_session); 无补充填 null
 
 【batch 判断规则】
 - 图片中列出多个岗位(如校招岗位列表) → message_type = "batch"
@@ -635,10 +528,9 @@ const VISION_PROMPT = `请仔细识别这张图片中的所有文字内容, 然�
   "deadline": "2026-08-15 或 null",
   "referral_code": "内推码或null",
   "source_url": "链接或null",
-  "requirements": "要求或null",
-  "description": null,
   "status_hint": "待投递",
-  "priority": "低",
+  "info_session": "宣讲会行程或null",
+  "remark": "备注或null",
   "match_key": "公司-岗位"
 }
 
@@ -650,22 +542,41 @@ const VISION_PROMPT = `请仔细识别这张图片中的所有文字内容, 然�
     "deadline": "2026-08-15 或 null",
     "referral_code": "内推码或null",
     "source_link": "链接或null",
-    "city": ["城市或未知"],
-    "requirements": "共享要求或null"
+    "city": ["城市或未知"]
   },
   "candidates": [
-    {"position": "岗位族1或具体岗位1", "description": null, "requirements": null},
-    {"position": "岗位族2或具体岗位2", "description": null, "requirements": null}
+    {"position": "岗位族1或具体岗位1"},
+    {"position": "岗位族2或具体岗位2"}
   ]
 }
 
 只输出 JSON, 不要任何解释文字。`;
 
-function normalizeImageData(image: string): string {
+function normalizeImageData(image: string): {
+  dataUri: string;
+  mime: string;
+  estimatedBytes: number;
+  base64Len: number;
+} {
+  // 输入可能已经是 data:image/xxx;base64,xxxx 格式
   if (image.startsWith('data:')) {
-    return image;
+    const headerMatch = image.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/);
+    const mime = headerMatch?.[1] ?? 'image/jpeg';
+    const base64Payload = headerMatch ? image.slice(headerMatch[0].length) : image;
+    const base64Len = base64Payload.length;
+    // base64 解码后体积 ≈ len * 3/4
+    const estimatedBytes = Math.floor(base64Len * 0.75);
+    return { dataUri: image, mime, estimatedBytes, base64Len };
   }
-  return `data:image/png;base64,${image}`;
+  // 裸 base64, 默认当 jpeg (前端 compressImage 统一输出 jpeg)
+  const base64Len = image.length;
+  const estimatedBytes = Math.floor(base64Len * 0.75);
+  return {
+    dataUri: `data:image/jpeg;base64,${image}`,
+    mime: 'image/jpeg',
+    estimatedBytes,
+    base64Len,
+  };
 }
 
 async function parseImageWithQwen(
@@ -682,7 +593,22 @@ async function parseImageWithQwen(
   const model = ENV_QWEN_MODEL;
 
   const url = `${baseUrl}/chat/completions`;
-  const imageData = normalizeImageData(imageBase64);
+  const imageInfo = normalizeImageData(imageBase64);
+  const imageData = imageInfo.dataUri;
+
+  // 诊断日志: 帮助排查 401 / 超时 / 空返回等常见问题
+  console.log(
+    `[千问视觉] 准备调用: model=${model}, baseUrl=${baseUrl}, ` +
+      `MIME=${imageInfo.mime}, base64长度=${imageInfo.base64Len.toLocaleString()} chars, ` +
+      `解码后约 ${(imageInfo.estimatedBytes / 1024 / 1024).toFixed(2)} MB, ` +
+      `key前缀=${apiKey.slice(0, 4)}...${apiKey.slice(-4)}, key长度=${apiKey.length}`
+  );
+  // DashScope hard limit: HTTP payload ≤ 6MB, base64 图像 payload ≤ 4.5MB
+  if (imageInfo.base64Len > 4500 * 1024) {
+    console.warn(
+      `[千问视觉] ⚠️ base64 payload 超过 4.5MB, DashScope compatible-mode 可能因 HTTP body > 6MB 返回 413 或截断导致 400/500`
+    );
+  }
 
   const runOnce = async (strict: boolean) => {
     const systemPrompt = strict
@@ -692,6 +618,9 @@ async function parseImageWithQwen(
     const userText = strict
       ? '识别这张图片, 提取所有招聘信息, 输出 JSON'
       : '识别这张图片中的招聘信息';
+
+    const t0 = Date.now();
+    console.log(`[千问视觉] 开始请求, 超时=${IMAGE_TIMEOUT}ms, strict=${strict}`);
 
     const res = await fetchWithTimeout(
       url,
@@ -725,6 +654,8 @@ async function parseImageWithQwen(
       },
       IMAGE_TIMEOUT
     );
+
+    console.log(`[千问视觉] 响应耗时: ${Date.now() - t0}ms, 状态: ${res.status}, strict=${strict}`);
 
     if (!res.ok) {
       const errText = await res.text();

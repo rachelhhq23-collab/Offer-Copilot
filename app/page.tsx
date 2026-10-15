@@ -81,13 +81,83 @@ function formatTimestamp(ts: number | null): string {
   return `${d.getMonth() + 1}月${d.getDate()}日`;
 }
 
+// ===== 安全 JSON 解析 =====
+async function safeJson<T = any>(res: Response): Promise<T> {
+  const text = await res.text();
+  if (!text || text.trim() === '') {
+    if (res.status === 502 || res.status === 504) {
+      throw new Error('服务器处理超时，请稍后重试');
+    }
+    throw new Error('服务器返回空响应，可能是请求超时，请稍后重试');
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error('服务器响应格式异常，请稍后重试');
+  }
+}
+
+/**
+ * 带自动重试的 fetch + JSON 解析
+ * 仅对空响应/网络错误重试，业务错误(422等)不重试
+ */
+async function fetchWithRetry<T>(
+  url: string,
+  options: RequestInit,
+  retries = 1
+): Promise<{ ok: boolean; data: T }> {
+  let lastError: Error = new Error('请求失败');
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      const text = await res.text();
+
+      if (!text || text.trim() === '') {
+        // 空响应 → 可能是超时, 重试
+        lastError = new Error(
+          res.status >= 500
+            ? '服务器处理超时，请稍后重试'
+            : '服务器返回空响应，可能是请求超时，请稍后重试'
+        );
+        if (attempt < retries) {
+          console.log(`[fetch] 第 ${attempt + 1} 次请求返回空响应, 1 秒后重试...`);
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        throw lastError;
+      }
+
+      try {
+        const data = JSON.parse(text) as T;
+        return { ok: res.ok, data };
+      } catch {
+        lastError = new Error('服务器响应格式异常，请稍后重试');
+        if (attempt < retries) {
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        throw lastError;
+      }
+    } catch (err) {
+      if (err === lastError) throw err;
+      lastError = err instanceof Error ? err : new Error('网络请求失败');
+      if (attempt < retries) {
+        console.log(`[fetch] 第 ${attempt + 1} 次请求失败: ${lastError.message}, 1 秒后重试...`);
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+      throw lastError;
+    }
+  }
+
+  throw lastError;
+}
+
 // ===== 类型定义 =====
 
 interface Candidate {
   position: string;
-  job_code: string | null;
-  description: string | null;
-  requirements: string | null;
 }
 
 interface SharedFields {
@@ -112,11 +182,8 @@ interface ParseResult {
   parsed?: {
     company: string | null;
     position: string | null;
-    job_code?: string | null;
     city: string[];
     deadline: string | null;
-    description?: string | null;
-    requirements: string | null;
     application_limit?: number | null;
     referral_code?: string | null;
     status_hint: string;
@@ -127,7 +194,8 @@ interface ParseResult {
     match_key: string;
     locations?: Array<{ city: string; date: string | null }>;
     source_url?: string | null;
-    priority?: string;
+    echelon?: string | null;
+    info_session?: string | null;
   };
   recordId?: string;
   message?: string;
@@ -153,11 +221,9 @@ interface HistoryRecordItem {
   recordId: string;
   company: string;
   position: string;
-  job_code: string | null;
   city: string[];
   deadline: string | null;
   status: string;
-  priority: string | null;
   last_updated_time: number | null;
   raw_text: string | null;
   raw_image: string | null;
@@ -165,6 +231,7 @@ interface HistoryRecordItem {
   todo: string | null;
   referral_code: string | null;
   source_url: string | null;
+  info_session: string | null;
 }
 
 interface PlanItem {
@@ -425,7 +492,7 @@ function DevConfigSection({
             <button className="btn btn-secondary" onClick={handleClear} disabled={!hasSaved && !appKey && !appSecret && !operatorId}>
               清除
             </button>
-            <button className="btn btn-primary" onClick={handleSave} disabled={!appKey.trim() && !appSecret.trim() && !operatorId.trim()}>
+            <button className="btn btn-primary" onClick={handleSave} disabled={!appKey.trim() || !appSecret.trim() || !operatorId.trim()}>
               {saved ? '已保存' : '保存'}
             </button>
           </div>
@@ -1052,6 +1119,7 @@ export default function HomePage() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [sourceChannels, setSourceChannels] = useState<string[]>([]);
+  const [echelon, setEchelon] = useState<string>('');
   const [sourceError, setSourceError] = useState('');
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [batchSubmitting, setBatchSubmitting] = useState(false);
@@ -1102,10 +1170,13 @@ export default function HomePage() {
   const showToast = (msg: string) => setToastMsg(msg);
 
   // ===== 提交相关函数 =====
-
+  // 参考: https://www.alibabacloud.com/help/en/model-studio/developer-reference/qwen-vl-compatible-with-openai
+  // - DashScope compatible-mode HTTP payload ≤ 6MB
+  // - base64 后膨胀约 1.33x, 因此原始图片 ≤ 4.5MB
+  // - 单图像素 ≤ 1,048,576 (约 1024x1024)
   const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
-  const MAX_COMPRESSED_SIZE = 4 * 1024 * 1024;
-  const MAX_IMAGE_DIMENSION = 2048;
+  const MAX_COMPRESSED_SIZE = 4 * 1024 * 1024; // 4MB 原始文件 (压缩后 base64 约 5.3MB < 6MB 限制)
+  const MAX_IMAGE_DIMENSION = 1024; // qwen-vl-plus compatible-mode 单图像素上限 ~1024x1024
 
   const fileToDataUrl = (file: File): Promise<string> =>
     new Promise((resolve, reject) => {
@@ -1124,6 +1195,8 @@ export default function HomePage() {
       img.onerror = () => reject(new Error('图片加载失败'));
     });
 
+    // 第一步: 按像素限制缩放到 1024x1024 以内 (qwen-vl-plus compatible-mode 硬限制)
+    // 像素 ≤ 1,048,576, 约等于 max(width, height) ≤ 1024
     let { width, height } = img;
     const ratio = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(width, height));
     width = Math.round(width * ratio);
@@ -1135,11 +1208,25 @@ export default function HomePage() {
     const ctx = canvas.getContext('2d')!;
     ctx.drawImage(img, 0, 0, width, height);
 
-    let quality = 0.9;
+    // 第二步: 逐步降低质量直到 base64 长度在 4.5MB 以内 (DashScope payload≤6MB)
+    const MAX_BASE64_LEN = 4500 * 1024; // 约 4.5MB base64 → 原始约 3.3MB, 膨胀后 < 6MB
+    let quality = 0.85;
     let result = canvas.toDataURL('image/jpeg', quality);
-    while (result.length > MAX_COMPRESSED_SIZE && quality > 0.3) {
+    while (result.length > MAX_BASE64_LEN && quality > 0.3) {
       quality -= 0.1;
       result = canvas.toDataURL('image/jpeg', quality);
+    }
+    // 如果降到 0.3 仍然太大, 继续按尺寸缩放 10% 直到满足
+    let safetyCounter = 0;
+    while (result.length > MAX_BASE64_LEN && safetyCounter < 5) {
+      const shrink = 0.9;
+      width = Math.round(canvas.width * shrink);
+      height = Math.round(canvas.height * shrink);
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(img, 0, 0, width, height);
+      result = canvas.toDataURL('image/jpeg', 0.75);
+      safetyCounter++;
     }
     return result;
   };
@@ -1155,13 +1242,9 @@ export default function HomePage() {
       return;
     }
     try {
-      let dataUrl: string;
-      if (file.size > MAX_COMPRESSED_SIZE) {
-        showToast('图片较大, 自动压缩中...');
-        dataUrl = await compressImage(file);
-      } else {
-        dataUrl = await fileToDataUrl(file);
-      }
+      // 任何图片都走压缩流程, 确保像素(≤1024)和体积(≤4.5MB base64)双满足 qwen-vl-plus 限制
+      showToast('正在准备图片...');
+      const dataUrl = await compressImage(file);
       setImageBase64(dataUrl);
       setImagePreview(dataUrl);
       setImageName(file.name || '招聘截图');
@@ -1214,7 +1297,6 @@ export default function HomePage() {
       setSourceError('请选择信息来源');
       return;
     }
-
     setLoading(true);
     setError('');
     setSourceError('');
@@ -1223,7 +1305,7 @@ export default function HomePage() {
     setSelectedIndices([]);
 
     try {
-      const body: { content?: string; image?: string; inputType?: 'text' | 'image'; source_channel?: string; workspace?: { baseId?: string; sheetId?: string; appKey?: string; appSecret?: string; operatorId?: string; demoMode?: boolean }; deepseekKey?: string; qwenKey?: string; demoMode?: boolean } = {};
+      const body: { content?: string; image?: string; inputType?: 'text' | 'image'; source_channel?: string; echelon?: string; workspace?: { baseId?: string; sheetId?: string; appKey?: string; appSecret?: string; operatorId?: string; demoMode?: boolean }; deepseekKey?: string; qwenKey?: string; demoMode?: boolean } = {};
       if (content.trim()) body.content = content.trim();
       if (imageBase64) {
         body.image = imageBase64;
@@ -1231,21 +1313,26 @@ export default function HomePage() {
       }
       // 信息来源必填 (多选, 逗号拼接)
       body.source_channel = sourceChannels.join(', ');
+      // 梯队选填 (不选则不发送, 后端保留已有值)
+      if (echelon) body.echelon = echelon;
       if (wsConfig) body.workspace = wsConfig;
       if (!demoMode && aiKeys?.deepseekKey) body.deepseekKey = aiKeys.deepseekKey;
       if (!demoMode && aiKeys?.qwenKey) body.qwenKey = aiKeys.qwenKey;
       if (demoMode) body.demoMode = true;
 
-      const res = await fetch('/api/submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const { ok, data } = await fetchWithRetry<ParseResult>(
+        '/api/submit',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        1 // 空响应/超时时自动重试 1 次
+      );
 
-      const data = (await res.json()) as ParseResult;
       setResult(data);
 
-      if (res.ok && data.success) {
+      if (ok && data.success) {
         // 提交成功后刷新历史记录, 确保切到机会页能看到最新数据
         loadHistory();
       } else {
@@ -1269,24 +1356,28 @@ export default function HomePage() {
     setError('');
 
     try {
-      const res = await fetch('/api/batch-submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          selected_indices: selectedIndices,
-          batch_result: result.batch_result,
-          source_channel: sourceChannels.join(', '),
-          content: content,
-          ...(imageBase64 ? { image: imageBase64 } : {}),
-          ...(wsConfig ? { workspace: wsConfig } : {}),
-          ...(demoMode ? { demoMode: true } : {}),
-        }),
-      });
+      const { ok, data } = await fetchWithRetry<BatchSubmitResponse>(
+        '/api/batch-submit',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            selected_indices: selectedIndices,
+            batch_result: result.batch_result,
+            source_channel: sourceChannels.join(', '),
+            ...(echelon ? { echelon } : {}),
+            content: content,
+            ...(imageBase64 ? { image: imageBase64 } : {}),
+            ...(wsConfig ? { workspace: wsConfig } : {}),
+            ...(demoMode ? { demoMode: true } : {}),
+          }),
+        },
+        1
+      );
 
-      const data = (await res.json()) as BatchSubmitResponse;
       setBatchResult(data);
 
-      if (res.ok && data.success) {
+      if (ok && data.success) {
         loadHistory();
       } else {
         setError(data.error ?? data.message ?? '批量提交失败');
@@ -1322,6 +1413,7 @@ export default function HomePage() {
     setError('');
     setSourceChannels([]);
     setSourceError('');
+    setEchelon('');
     setSelectedIndices([]);
     setBatchResult(null);
   };
@@ -1337,7 +1429,7 @@ export default function HomePage() {
         headers: workspaceHeader,
         cache: 'no-store',
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (data.success) {
         setHistoryRecords(data.records);
       } else {
@@ -1363,7 +1455,7 @@ export default function HomePage() {
         setHistoryRecords((prev) => prev.filter((r) => r.recordId !== recordId));
         showToast('已删除');
       } else {
-        const data = await res.json();
+        const data = await safeJson(res);
         setError(data.error ?? '删除失败');
       }
     } catch (err) {
@@ -1391,7 +1483,7 @@ export default function HomePage() {
           ...(demoMode ? { demoMode: true } : {}),
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (res.ok && data.success) {
         setPlanResult({ plan: data.plan, summary: data.summary });
       } else {
@@ -1414,7 +1506,7 @@ export default function HomePage() {
       if (res.ok) {
         showToast(`已更新为「${newStatus}」`);
       } else {
-        const data = await res.json();
+        const data = await safeJson(res);
         showToast(data.error ?? '更新失败');
       }
     } catch {
@@ -1615,6 +1707,23 @@ export default function HomePage() {
                       <span>{sourceError}</span>
                     </div>
                   )}
+                </div>
+
+                <div className="source-section">
+                  <div className="source-label">梯队</div>
+                  <div className="source-desc">选填, 不选则保留已有值</div>
+                  <div className="source-chips">
+                    {(['A', 'B', 'C', 'S', 'SS'] as const).map((e) => (
+                      <div
+                        key={e}
+                        className={`source-chip ${echelon === e ? 'active' : ''}`}
+                        onClick={() => setEchelon(echelon === e ? '' : e)}
+                      >
+                        {echelon === e && <Check size={14} />}
+                        {e}
+                      </div>
+                    ))}
+                  </div>
                 </div>
 
                 {error && (
@@ -1847,7 +1956,7 @@ export default function HomePage() {
                 <div className="empty-title">{hasActiveOpportunities ? '排出今晚的投递节奏' : '暂无机会可安排'}</div>
                 <div className="empty-desc">
                   {hasActiveOpportunities
-                    ? '综合截止日期、当前阶段、所需材料、预计耗时和优先级,帮你找出今晚最值得先攻克的事。'
+                    ? '综合截止日期、当前阶段、所需材料、预计耗时和梯队,帮你找出今晚最值得先攻克的事。'
                     : '提交一些招聘信息后再来试试吧'}
                 </div>
                 {!hasActiveOpportunities && (
@@ -2038,9 +2147,7 @@ function BatchSelectionCard({
               <div className="candidate-info">
                 <div className="candidate-main">
                   <span className="candidate-position">{candidate.position}</span>
-                  {candidate.job_code && <span className="candidate-code">{candidate.job_code}</span>}
                 </div>
-                {candidate.description && <div className="candidate-requirements">{candidate.description}</div>}
               </div>
             </label>
           );
@@ -2074,7 +2181,6 @@ function BatchResultCard({
           <div key={idx} className={`batch-result-item ${item.action === 'created' ? 'is-new' : 'is-update'}`}>
             <div className="batch-result-main">
               <span className="candidate-position">{item.candidate.position}</span>
-              {item.candidate.job_code && <span className="candidate-code">{item.candidate.job_code}</span>}
             </div>
             <div className="batch-result-status">{item.message}</div>
           </div>
@@ -2142,16 +2248,14 @@ function ResultCard({ result }: { result: ParseResult }) {
           value={p.deadline ? formatDate(p.deadline) : <span className="muted-text">未识别到截止日期</span>}
         />
         <InfoRow label="当前阶段" value={p.status_hint} />
-        {p.priority && <InfoRow label="优先级" value={p.priority} />}
-        {p.job_code && <InfoRow label="岗位编号" value={p.job_code} />}
+        {p.echelon && <InfoRow label="梯队" value={p.echelon} />}
         {p.application_limit != null && (
           <InfoRow label="投递数量限制" value={`限投 ${p.application_limit} 个`} />
         )}
         {p.referral_code && <InfoRow label="内推码" value={p.referral_code} />}
         {p.source_channel && <InfoRow label="信息来源渠道" value={p.source_channel} />}
         {p.estimated_minutes != null && <InfoRow label="预计耗时" value={`${p.estimated_minutes} 分钟`} />}
-        {p.description && <InfoRow label="岗位描述" value={p.description} fullWidth />}
-        {p.requirements && <InfoRow label="岗位要求" value={p.requirements} fullWidth />}
+        {p.info_session && <InfoRow label="宣讲会行程" value={p.info_session} fullWidth />}
 
         {allLocations.length > 0 && (
           <div className="info-row full">
@@ -2291,7 +2395,7 @@ function HistoryCard({ record, onDelete, workspaceHeader }: { record: HistoryRec
           content: seg.content,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!data.success) {
         throw new Error(data.error || '删除失败');
       }
@@ -2337,10 +2441,15 @@ function HistoryCard({ record, onDelete, workspaceHeader }: { record: HistoryRec
         )}
       </div>
 
-      {(record.job_code || record.referral_code) && (
+      {record.referral_code && (
         <div className="history-extra-row">
-          {record.job_code && <span className="candidate-code">{record.job_code}</span>}
-          {record.referral_code && <span className="referral-tag">内推: {record.referral_code}</span>}
+          <span className="referral-tag">内推: {record.referral_code}</span>
+        </div>
+      )}
+
+      {record.info_session && (
+        <div className="history-extra-row">
+          <span className="info-session-tag">宣讲会: {record.info_session}</span>
         </div>
       )}
 

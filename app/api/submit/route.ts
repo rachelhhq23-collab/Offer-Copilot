@@ -14,6 +14,7 @@ import { validateParsedJob } from '@/lib/validator';
 import {
   fetchAllRecords,
   matchRecord,
+  matchAllCompanyRecords,
   createRecord,
   updateRecord,
   preUploadImage,
@@ -29,6 +30,7 @@ import type {
 } from '@/lib/types';
 
 export const runtime = 'nodejs';
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
@@ -96,11 +98,8 @@ export async function POST(request: Request) {
           message_type: 'single',
           company: batchData.source_company,
           position: candidate.position,
-          job_code: candidate.job_code,
           city: sf.city,
           deadline: sf.deadline,
-          description: candidate.description,
-          requirements: candidate.requirements,
           application_limit: sf.application_limit,
           referral_code: sf.referral_code,
           status_hint: '待投递',
@@ -108,7 +107,6 @@ export async function POST(request: Request) {
           estimated_minutes: null,
           match_key: `${batchData.source_company}-${candidate.position}`,
           source_url: sf.source_link,
-          priority: '中',
           source_channel: body.source_channel ?? null,
           raw_text: body.content ?? null,
           raw_image: null,
@@ -130,6 +128,8 @@ export async function POST(request: Request) {
     // ========== single 流程 ==========
     const parsed = data as ParsedJob;
     parsed.source_channel = body.source_channel ?? null;
+    // 梯队选填, 用户未选则为 null (由 isFieldDifferent 保护不覆盖已有值)
+    parsed.echelon = body.echelon ?? null;
     // 原始输入文本: 纯文本提交用原文, 图片提交生成 AI 识别摘要
     if (body.content && body.content.trim()) {
       parsed.raw_text = body.content.trim();
@@ -184,6 +184,34 @@ async function processSingleJob(
 
   // 使用预查询结果, 或在预查询失败时重新查询
   const records = existingRecords ?? await fetchAllRecords(workspace);
+
+  // 宣讲会场景: info_session 非空且无岗位名 → 更新该公司下所有记录
+  // (宣讲会是公司维度信息, 不是岗位维度, 应同步到所有岗位记录)
+  if (cleaned.info_session && !cleaned.position && cleaned.company) {
+    const allMatched = matchAllCompanyRecords(cleaned.company, records);
+    if (allMatched.length > 0) {
+      console.log(`[submit] 宣讲会场景: 匹配到 ${allMatched.length} 条 "${cleaned.company}" 记录, 并行更新`);
+      // 并行更新所有匹配记录, 避免串行 updateRecord 在记录数多时超出 Vercel 10s 限制
+      const updateResults = await Promise.all(
+        allMatched.map(async (rec) => {
+          await updateRecord(rec.recordId, cleaned, rec, workspace);
+          return rec.recordId;
+        })
+      );
+      return NextResponse.json({
+        success: true,
+        message_type: 'single',
+        action: 'updated' as const,
+        parsed: cleaned,
+        recordId: updateResults[0],
+        recordIds: updateResults,
+        message: `🔄 宣讲会行程已同步至 ${cleaned.company} 的 ${allMatched.length} 条记录`,
+      } satisfies SubmitResponse);
+    }
+    // 公司下无记录, 走正常新增流程
+    console.log(`[submit] 宣讲会场景: 未找到 "${cleaned.company}" 的已有记录, 执行新增`);
+  }
+
   const matched = await matchRecord(cleaned, records);
 
   let action: 'created' | 'updated';

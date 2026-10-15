@@ -1,15 +1,16 @@
 /**
  * 钉钉开放平台 AI 表格 (notable) API 模块
  *
- * 字段映射 (16 个字段):
- *   公司(文本) | 岗位(文本) | 岗位编号(文本) | 城市(多选)
- *   投递DDL(日期) | 岗位描述(文本) | 岗位要求(文本) | 投递数量限制(数字)
+ * 字段映射:
+ *   公司(文本) | 岗位(文本) | 城市(多选)
+ *   投递DDL(日期) | 投递数量限制(数字)
  *   内推码(文本) | 状态(单选) | 待办(文本) | 预计耗时(数字)
- *   备注(文本) | 来源链接(网页链接) | 优先级标记(单选) | 最后更新时间(自动)
+ *   备注(文本) | 来源链接(网页链接) | 梯队(单选) | 信息来源渠道(文本)
+ *   原始输入文本(文本) | 原始输入图片(文本) | 最后更新时间(自动)
  */
 
 import type { DingTalkRecord, ParsedJob, PreUploadedAttachment } from './types';
-import { ESTIMATED_MINUTES_BY_STATUS, isWaitingTypeTodo } from './types';
+import { ESTIMATED_MINUTES_BY_STATUS, isWaitingTypeTodo, isPassiveStatus } from './types';
 
 const APP_KEY = process.env.DEMO_DINGTALK_APP_KEY ?? '';
 const APP_SECRET = process.env.DEMO_DINGTALK_APP_SECRET ?? '';
@@ -27,6 +28,75 @@ function validateDemoEnv(): string[] {
 }
 
 const API_BASE = 'https://api.dingtalk.com';
+
+// ============== 请求超时与重试 ==============
+// 背景: Vercel Hobby 函数硬上限 10s, 而钉钉请求此前没有超时, 连接挂起时会
+// 一直等到 Vercel 强杀 (返回 504 空响应), 前端表现为"请求超时"。
+// 这里给所有钉钉请求加主动超时, 确保在函数预算内"快速失败"而非"挂到强杀"。
+const DT_TIMEOUT_TOKEN = 5000;   // gettoken / users/me / sheets 列表
+const DT_TIMEOUT_READ = 6000;    // 记录查询
+const DT_TIMEOUT_WRITE = 6000;   // 新增/更新记录
+const DT_TIMEOUT_UPLOAD = 6000;  // 图片上传
+
+/** 带超时的 fetch, 超时时主动 abort 并抛出明确错误 */
+async function dtFetch(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`钉钉请求超时 (${timeoutMs}ms): ${url.slice(0, 80)}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 记录写入 (POST/PUT) 的快速重试包装:
+ * 仅对 503/500 和网络/超时错误重试 1 次 (0.6s 间隔), 业务错误 (4xx/200含code) 不重试。
+ * 返回最终 Response 由调用方继续处理状态码与响应体。
+ */
+async function dtWriteWithRetry(
+  method: 'POST' | 'PUT',
+  url: string,
+  token: string,
+  body: unknown,
+  label: string
+): Promise<Response> {
+  const options: RequestInit = {
+    method,
+    headers: {
+      'x-acs-dingtalk-access-token': token,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  };
+
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await dtFetch(url, options, DT_TIMEOUT_WRITE);
+      // 业务错误 / 成功都直接返回给调用方; 仅 5xx 重试
+      if (res.ok || (res.status !== 500 && res.status !== 503)) {
+        return res;
+      }
+      const errText = await res.text();
+      lastError = new Error(`钉钉${label}失败: HTTP ${res.status} - ${errText.slice(0, 300)}`);
+      console.warn(`[钉钉] ${label} 5xx (尝试 ${attempt}/2): HTTP ${res.status}, ${errText.slice(0, 200)}`);
+    } catch (err) {
+      // 网络错误 / 超时也重试
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[钉钉] ${label} 网络/超时错误 (尝试 ${attempt}/2): ${lastError.message}`);
+    }
+    if (attempt < 2) {
+      await new Promise((r) => setTimeout(r, 600));
+    }
+  }
+  throw lastError ?? new Error(`钉钉${label}失败: 超过重试次数`);
+}
 
 /**
  * 工作空间配置: 每个钉钉表格对应一个配置
@@ -79,10 +149,10 @@ async function fetchFirstSheetId(token: string, baseId: string, operatorId: stri
   const url = `${API_BASE}/v1.0/notable/bases/${baseId}/sheets?operatorId=${encodeURIComponent(operatorId)}`;
   console.log(`[钉钉] 自动检测 sheetId: ${url}`);
 
-  const res = await fetch(url, {
+  const res = await dtFetch(url, {
     method: 'GET',
     headers: { 'x-acs-dingtalk-access-token': token },
-  });
+  }, DT_TIMEOUT_TOKEN);
 
   if (!res.ok) {
     const errText = await res.text();
@@ -153,6 +223,8 @@ interface TokenCache {
 }
 
 let tokenCache: TokenCache | null = null;
+// 正常模式按 appKey 分别缓存 (多工作空间共用凭据, 同一 appKey 只取一次 token)
+const tokenCacheByAppKey = new Map<string, TokenCache>();
 let operatorIdCache: string | null = null;
 const TOKEN_BUFFER = 300;
 
@@ -160,6 +232,7 @@ const TOKEN_BUFFER = 300;
  * 获取钉钉 access_token
  * 演示模式: 使用环境变量
  * 正常模式: 使用 config 传入的 appKey/appSecret
+ * 两种模式均缓存 7000 秒 (钉钉 token 有效期 7200 秒), 避免一次提交内重复 gettoken
  */
 async function getAccessToken(config?: WorkspaceConfig): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
@@ -173,7 +246,7 @@ async function getAccessToken(config?: WorkspaceConfig): Promise<string> {
       throw new Error('演示模式缺少 DEMO_DINGTALK_APP_KEY / DEMO_DINGTALK_APP_SECRET 环境变量');
     }
     const url = `https://oapi.dingtalk.com/gettoken?appkey=${encodeURIComponent(APP_KEY)}&appsecret=${encodeURIComponent(APP_SECRET)}`;
-    const res = await fetch(url, { method: 'GET' });
+    const res = await dtFetch(url, { method: 'GET' }, DT_TIMEOUT_TOKEN);
     if (!res.ok) throw new Error(`获取钉钉 access_token 失败: HTTP ${res.status}`);
     const data = (await res.json()) as { errcode: number; errmsg: string; access_token?: string; expires_in?: number };
     if (data.errcode !== 0 || !data.access_token) {
@@ -191,13 +264,21 @@ async function getAccessToken(config?: WorkspaceConfig): Promise<string> {
     throw new Error('缺少钉钉凭据: 请在设置页面填写 AppKey/AppSecret');
   }
 
+  // 按 appKey 缓存, 命中则直接返回 (一次提交内 getAccessToken 会被调用多次)
+  const cached = tokenCacheByAppKey.get(appKey);
+  if (cached && cached.expiresAt - TOKEN_BUFFER > now) {
+    return cached.token;
+  }
+
   const url = `https://oapi.dingtalk.com/gettoken?appkey=${encodeURIComponent(appKey)}&appsecret=${encodeURIComponent(appSecret)}`;
-  const res = await fetch(url, { method: 'GET' });
+  const res = await dtFetch(url, { method: 'GET' }, DT_TIMEOUT_TOKEN);
   if (!res.ok) throw new Error(`获取钉钉 access_token 失败: HTTP ${res.status}`);
   const data = (await res.json()) as { errcode: number; errmsg: string; access_token?: string; expires_in?: number };
   if (data.errcode !== 0 || !data.access_token) {
     throw new Error(`获取钉钉 access_token 失败: ${data.errcode} ${data.errmsg}`);
   }
+  const expiresIn = Math.min(data.expires_in ?? 7200, 7000);
+  tokenCacheByAppKey.set(appKey, { token: data.access_token, expiresAt: now + expiresIn });
   return data.access_token;
 }
 
@@ -227,20 +308,27 @@ async function getOperatorId(token: string, config?: WorkspaceConfig): Promise<s
   if (!opId) {
     throw new Error('缺少操作人 ID: 请在设置页面填写 UnionId');
   }
+  // 钉钉 unionId 长度校验: 通常 20+ 字符 (如 2qItsB4JPrEG8tWQDK4mdQiEiE)
+  // 注意: unionId 不一定以 "U" 开头, 新版格式可能是任意字母数字串
+  // 这里只做最低限度的长度校验, 防止误填 AppKey(短) 或 userId(数字)
+  if (opId.length < 16) {
+    console.warn(`[钉钉] operatorId 疑似无效: 长度=${opId.length}, 值=${opId.slice(0, 6)}...`);
+    throw new Error(`操作人 ID 疑似无效 (长度 ${opId.length}, 正常 unionId 应 20+ 字符)。请确认填写的是 unionId 而非 userId/AppKey`);
+  }
   return opId;
 }
 
 async function autoFetchOperatorId(token: string): Promise<string> {
   try {
     const url = `${API_BASE}/v1.0/contact/users/me`;
-    const res = await fetch(url, {
+    const res = await dtFetch(url, {
       method: 'POST',
       headers: {
         'x-acs-dingtalk-access-token': token,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({}),
-    });
+    }, DT_TIMEOUT_TOKEN);
     if (res.ok) {
       const data = (await res.json()) as { unionId?: string };
       if (data.unionId) {
@@ -287,14 +375,14 @@ export async function fetchAllRecords(config?: WorkspaceConfig): Promise<DingTal
     const body: Record<string, unknown> = { maxResults: 100 };
     if (nextToken) body.nextToken = nextToken;
 
-    const res = await fetch(url, {
+    const res = await dtFetch(url, {
       method: 'POST',
       headers: {
         'x-acs-dingtalk-access-token': token,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-    });
+    }, DT_TIMEOUT_READ);
 
     if (!res.ok) {
       const errText = await res.text();
@@ -382,7 +470,7 @@ async function uploadImageAttachment(
 
     // 2. 获取资源上传信息
     const uploadInfoUrl = `${API_BASE}/v1.0/doc/docs/resources/${baseId}/uploadInfos/query?operatorId=${encodeURIComponent(operatorId)}`;
-    const infoRes = await fetch(uploadInfoUrl, {
+    const infoRes = await dtFetch(uploadInfoUrl, {
       method: 'POST',
       headers: {
         'x-acs-dingtalk-access-token': token,
@@ -393,7 +481,7 @@ async function uploadImageAttachment(
         mediaType: mimeType,
         resourceName,
       }),
-    });
+    }, DT_TIMEOUT_UPLOAD);
 
     if (!infoRes.ok) {
       const errText = await infoRes.text();
@@ -423,13 +511,13 @@ async function uploadImageAttachment(
     }
 
     // 3. PUT 上传文件到 uploadUrl
-    const putRes = await fetch(infoData.uploadUrl, {
+    const putRes = await dtFetch(infoData.uploadUrl, {
       method: 'PUT',
       headers: {
         'Content-Type': mimeType,
       },
       body: buffer,
-    });
+    }, DT_TIMEOUT_UPLOAD);
 
     if (!putRes.ok) {
       const errText = await putRes.text();
@@ -496,7 +584,7 @@ function getLinkLabel(status: string | null | undefined): string {
 
 /**
  * 根据 ParsedJob 构建钉钉表格字段
- * 严格对齐 16 个字段, null 值字段不写入
+ * null 值字段不写入
  */
 function buildFields(parsed: ParsedJob): Record<string, unknown> {
   const fields: Record<string, unknown> = {};
@@ -504,7 +592,6 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   // ---- 核心字段 ----
   if (parsed.company) fields['公司'] = parsed.company;
   if (parsed.position) fields['岗位'] = parsed.position;
-  if (parsed.job_code) fields['岗位编号'] = parsed.job_code;
 
   // ---- 城市 (多选数组) ----
   const cities = normalizeCityArray(parsed.city);
@@ -517,16 +604,6 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   if (deadline) {
     const ts = dateStringToTimestamp(deadline);
     if (ts) fields['投递DDL'] = ts;
-  }
-
-  // ---- 岗位描述 (过滤占位文本) ----
-  if (parsed.description && !isPlaceholderValue(parsed.description)) {
-    fields['岗位描述'] = parsed.description;
-  }
-
-  // ---- 岗位要求 (过滤占位文本) ----
-  if (parsed.requirements && !isPlaceholderValue(parsed.requirements)) {
-    fields['岗位要求'] = parsed.requirements;
   }
 
   // ---- 备注 (过滤占位文本) ----
@@ -546,7 +623,13 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   if (parsed.status_hint) fields['状态'] = parsed.status_hint;
 
   // ---- 待办 ----
-  if (parsed.todo) fields['待办'] = parsed.todo;
+  // 被动/结束类状态 (已投递/Offer/已拒绝/各种挂): 显式写 null 清空旧待办,
+  // 否则状态变成"面试挂"后, 待办还残留着"准备群面", 计划页会把它当成可执行任务
+  if (isPassiveStatus(parsed.status_hint)) {
+    fields['待办'] = null;
+  } else if (parsed.todo) {
+    fields['待办'] = parsed.todo;
+  }
 
   // ---- 预计耗时 (数字) ----
   // 规则: 预计耗时与待办严格绑定
@@ -554,7 +637,7 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
   // 2. 待办为"等待结果"类 (如"一面结束, 等待下一步通知") → 预计耗时 = null (虽有待办但无需行动)
   // 3. 待办为正常行动类 → 按状态对照表填写, 笔试优先用 AI 返回的真实时长
   if (parsed.status_hint && parsed.status_hint in ESTIMATED_MINUTES_BY_STATUS) {
-    if (parsed.todo && !isWaitingTypeTodo(parsed.todo)) {
+    if (parsed.todo && !isWaitingTypeTodo(parsed.todo, parsed.status_hint)) {
       const min = parsed.estimated_minutes ?? ESTIMATED_MINUTES_BY_STATUS[parsed.status_hint];
       fields['预计耗时'] = min != null ? Number(min) : null;
     } else {
@@ -574,9 +657,14 @@ function buildFields(parsed: ParsedJob): Record<string, unknown> {
     }
   }
 
-  // ---- 优先级标记 ----
-  if (parsed.priority) {
-    fields['优先级标记'] = normalizePriority(parsed.priority);
+  // ---- 梯队 (A/B/C/S/SS, 用户选填, 未选则不写保留已有值) ----
+  if (parsed.echelon) {
+    fields['梯队'] = parsed.echelon;
+  }
+
+  // ---- 宣讲会行程 (时间+地点, 含教学楼教室) ----
+  if (parsed.info_session && !isPlaceholderValue(parsed.info_session)) {
+    fields['宣讲会行程'] = parsed.info_session;
   }
 
   // ---- 信息来源渠道 ----
@@ -644,10 +732,11 @@ function isFieldDifferent(key: string, newValue: unknown, oldValue: unknown): bo
   const isEmpty = (v: unknown) =>
     v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0);
 
-  // 规则 1: null 不覆盖已有有效值 (预计耗时、原始输入文本除外)
-  // - 预计耗时: 状态变更时需要清空
-  // - 原始输入文本: 由追加逻辑单独处理, 过滤阶段不参与
-  if (isEmpty(newValue) && !isEmpty(oldValue) && key !== '预计耗时' && key !== '原始输入文本' && key !== '原始输入图片') {
+  // 规则 1: null 不覆盖已有有效值 (预计耗时、待办、原始输入文本/图片除外)
+  // - 预计耗时/待办: 状态变更为结束类 (挂/Offer/已投递) 时需要显式清空旧值,
+  //   否则会残留"准备群面"等失效待办, 被计划页当成可执行任务
+  // - 原始输入文本/图片: 由追加逻辑单独处理, 过滤阶段不参与
+  if (isEmpty(newValue) && !isEmpty(oldValue) && key !== '预计耗时' && key !== '待办' && key !== '原始输入文本' && key !== '原始输入图片') {
     console.log(`    [保护] 字段 "${key}" 新值为空但旧值有内容, 跳过 (保留旧值)`);
     return false;
   }
@@ -660,12 +749,11 @@ function isFieldDifferent(key: string, newValue: unknown, oldValue: unknown): bo
       return false;
     }
   }
-  // 优先级="中" 是 AI 默认值, 不应覆盖用户已设置的优先级
-  if (key === '优先级标记' && newValue === '中') {
-    if (!isEmpty(oldValue) && oldValue !== '中') {
-      console.log(`    [保护] 字段 "优先级标记" 新值为默认"中", 旧值为 ${JSON.stringify(oldValue)}, 跳过`);
-      return false;
-    }
+  // 状态保护: 新值"待投递"是 AI 默认兜底值, 不应覆盖已有进展状态
+  // 场景: 宣讲会消息无明确进展, AI 默认返回"待投递", 不应把"一面""群面"等覆盖退步
+  if (key === '状态' && newValue === '待投递' && !isEmpty(oldValue) && oldValue !== '待投递') {
+    console.log(`    [保护] 字段 "状态" 新值为默认"待投递", 旧值为 "${oldValue}", 跳过`);
+    return false;
   }
 
   // 规则 3: 公司名子串保护: AI 识别的简称不应覆盖原表全称
@@ -699,6 +787,20 @@ function isFieldDifferent(key: string, newValue: unknown, oldValue: unknown): bo
   }
 
   return newValue !== oldValue;
+}
+
+/**
+ * 从钉钉字段值中提取时间戳 (毫秒)
+ * "最后更新时间"字段可能是数字时间戳或字符串
+ */
+function extractTimestamp(value: unknown): number | null {
+  if (!value) return null;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const n = Number(value);
+    return isNaN(n) ? null : n;
+  }
+  return null;
 }
 
 /**
@@ -747,14 +849,7 @@ export async function createRecord(parsed: ParsedJob, config?: WorkspaceConfig):
 
   const url = buildUrl('records', baseId, finalSheetId, operatorId);
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'x-acs-dingtalk-access-token': token,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ records: [{ fields }] }),
-  });
+  const res = await dtWriteWithRetry('POST', url, token, { records: [{ fields }] }, '新增记录');
 
   if (!res.ok) {
     const errText = await res.text();
@@ -876,21 +971,13 @@ export async function updateRecord(
 
   console.log(`[钉钉] 准备更新的字段:`, JSON.stringify(fields, null, 2));
 
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'x-acs-dingtalk-access-token': token,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      records: [
-        {
-          id: recordId,
-          fields,
-        },
-      ],
-    }),
-  });
+  const res = await dtWriteWithRetry(
+    'PUT',
+    url,
+    token,
+    { records: [{ id: recordId, fields }] },
+    '更新记录'
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -904,43 +991,12 @@ export async function updateRecord(
 
 // ============== 匹配逻辑 ==============
 
-export function findRecordByJobCode(
-  jobCode: string | null | undefined,
-  records: DingTalkRecord[]
-): DingTalkRecord | null {
-  if (!jobCode) return null;
-
-  const code = jobCode.trim();
-  if (!code) return null;
-
-  for (const record of records) {
-    const fields = record.fields as Record<string, unknown>;
-    const recordCode = String(fields['岗位编号'] ?? '').trim();
-    if (recordCode && recordCode === code) {
-      console.log(`[匹配] 通过岗位编号匹配成功: ${code} → ${record.recordId}`);
-      return record;
-    }
-  }
-
-  console.log(`[匹配] 岗位编号未找到匹配: ${code}`);
-  return null;
-}
-
 export async function matchRecord(
   parsed: ParsedJob,
   existingRecords: DingTalkRecord[]
 ): Promise<DingTalkRecord | null> {
-  // 优先岗位编号精确匹配
-  if (parsed.job_code) {
-    const byCode = findRecordByJobCode(parsed.job_code, existingRecords);
-    if (byCode) return byCode;
-    // 有岗位编号但不匹配时, 不回退到模糊匹配, 避免不同岗位互相覆盖
-    console.log(`[匹配] 岗位编号 ${parsed.job_code} 未匹配, 跳过模糊匹配, 将创建新记录`);
-    return null;
-  }
-
-  // 无岗位编号时, 回退到模糊匹配
-  const matched = await aiMatchRecord(parsed.match_key, existingRecords);
+  // 公司+岗位模糊匹配
+  const matched = await aiMatchRecord(parsed.match_key, existingRecords, parsed.status_hint);
   if (matched) return matched;
 
   // 最终回退: 原始文本完全一致匹配 (防止 AI 返回不同岗位名导致重复创建)
@@ -958,14 +1014,35 @@ export async function matchRecord(
   return null;
 }
 
+/**
+ * 宣讲会场景: 匹配某公司下所有记录 (宣讲会是公司维度信息, 应同步到所有岗位记录)
+ * 使用精确公司名匹配 (双向 includes), 不依赖 match_key
+ * 返回所有匹配的记录, 供调用方逐条更新
+ */
+export function matchAllCompanyRecords(
+  company: string,
+  existingRecords: DingTalkRecord[]
+): DingTalkRecord[] {
+  const companyLower = company.toLowerCase().trim();
+  const candidates = existingRecords.filter((r) => {
+    const c = String(r.fields?.['公司'] ?? '').toLowerCase().trim();
+    if (!c) return false;
+    // 精确匹配或双向包含 (如 "DJI 大疆" 包含 "大疆")
+    return c === companyLower || c.includes(companyLower) || companyLower.includes(c);
+  });
+  console.log(`[匹配] matchAllCompanyRecords: 公司 "${company}" 匹配到 ${candidates.length} 条记录`);
+  return candidates;
+}
+
 export async function aiMatchRecord(
   newMatchKey: string,
-  existingRecords: DingTalkRecord[]
+  existingRecords: DingTalkRecord[],
+  statusHint?: string | null
 ): Promise<DingTalkRecord | null> {
   if (existingRecords.length === 0) return null;
 
   // 统一使用精确匹配, 避免 AI 将同一公司不同岗位误判为相同
-  return simpleFuzzyMatch(newMatchKey, existingRecords);
+  return simpleFuzzyMatch(newMatchKey, existingRecords, statusHint);
 }
 
 /**
@@ -984,16 +1061,42 @@ function normalizePosition(position: string): string {
   return s.trim();
 }
 
+/**
+ * 岗位名双字组 (bigram) Dice 相似度
+ * 用于进展更新场景: 用户口语化的岗位名与表格中的正式名可能只有尾部差异
+ * 例: "智能服务产品运营" vs "智能服务产品实习生" → 0.67
+ *     "产品运营" vs "产品经理" → 0.33 (低于阈值, 不误匹配)
+ */
+function bigramDice(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const grams = (s: string): Set<string> => {
+    const g = new Set<string>();
+    for (let i = 0; i < s.length - 1; i++) g.add(s.slice(i, i + 2));
+    return g;
+  };
+  const ga = grams(a);
+  const gb = grams(b);
+  if (ga.size === 0 || gb.size === 0) return 0;
+  let inter = 0;
+  ga.forEach((x) => {
+    if (gb.has(x)) inter++;
+  });
+  return (2 * inter) / (ga.size + gb.size);
+}
+
 function simpleFuzzyMatch(
   matchKey: string,
-  records: DingTalkRecord[]
+  records: DingTalkRecord[],
+  statusHint?: string | null
 ): DingTalkRecord | null {
   const keyLower = matchKey.toLowerCase().replace(/\s+/g, '');
   const keyParts = keyLower.split(/[-_]/);
   const keyCompany = keyParts[0] ?? '';
   const keyPosition = normalizePosition(keyParts.slice(1).join('-'));
+  // 进展更新类消息 (非"待投递"): 用户在说一个已跟踪机会的新状态, 岗位名允许口语化
+  const isUpdate = !!statusHint && statusHint !== '待投递';
 
-  console.log(`[匹配] simpleFuzzyMatch: matchKey="${matchKey}", keyCompany="${keyCompany}", keyPosition="${keyPosition}", 共${records.length}条记录`);
+  console.log(`[匹配] simpleFuzzyMatch: matchKey="${matchKey}", keyCompany="${keyCompany}", keyPosition="${keyPosition}", status="${statusHint ?? ''}", isUpdate=${isUpdate}, 共${records.length}条记录`);
 
   // 第一优先: 公司+岗位精确匹配
   if (keyCompany && keyPosition) {
@@ -1027,11 +1130,32 @@ function simpleFuzzyMatch(
     console.log(`  [跳过] 优先级1: keyCompany="${keyCompany}", keyPosition="${keyPosition}" (需两者都非空)`);
   }
 
+  // 优先级 1.7: 进展更新 + 岗位名高相似度 (仅更新类消息启用, 新机会不参与, 避免误合并)
+  // 例: 用户输入"抖音集团-智能服务产品运营群面已挂", 表格中岗位名为"智能服务产品实习生"
+  if (isUpdate && keyCompany && keyPosition) {
+    let best: { record: DingTalkRecord; score: number } | null = null;
+    for (const record of records) {
+      const fields = record.fields as Record<string, unknown>;
+      const company = String(fields['公司'] ?? '').toLowerCase();
+      const position = normalizePosition(String(fields['岗位'] ?? ''));
+      const companyMatch =
+        company === keyCompany || company.includes(keyCompany) || keyCompany.includes(company);
+      if (!companyMatch || !position) continue;
+      const score = bigramDice(keyPosition, position);
+      console.log(`  [优先级1.7] 记录${record.recordId}: "${position}" vs "${keyPosition}" 相似度=${score.toFixed(2)}`);
+      if (!best || score > best.score) best = { record, score };
+    }
+    if (best && best.score >= 0.62) {
+      console.log(`  [匹配成功] 优先级1.7 (进展更新+岗位相似度 ${best.score.toFixed(2)}): recordId=${best.record.recordId}`);
+      return best.record;
+    }
+  }
+
   // 第二优先: 仅公司名匹配 (进展更新场景, 如"大疆收到群面通知")
   // 只有当该公司在表格中只有一条记录时才自动匹配, 避免同公司多岗位歧义
-  // 注意: 如果 match_key 中包含岗位信息 (keyPosition 非空), 跳过此回退,
-  // 否则同公司不同岗位的批量提交会误匹配到刚创建的记录
-  if (keyCompany && !keyPosition) {
+  // 新增类消息 (待投递) 要求 match_key 不带岗位名才走此回退, 防止批量提交误匹配;
+  // 进展更新类消息 (测评/面试/挂等) 即使带了岗位名, 只要公司下仅 1 条记录即无歧义, 允许匹配
+  if (keyCompany && (!keyPosition || isUpdate)) {
     const candidates: DingTalkRecord[] = [];
     for (const record of records) {
       const fields = record.fields as Record<string, unknown>;
@@ -1106,30 +1230,6 @@ function normalizeCity(city: string): string {
   return '其他';
 }
 
-function normalizePriority(priority: string): string {
-  const validPriorities = ['高', '中', '低', '暂缓'];
-  const normalized = priority.trim();
-
-  if (validPriorities.includes(normalized)) {
-    return normalized;
-  }
-
-  const map: Record<string, string> = {
-    '紧急': '高', '急招': '高', '尽快': '高', '最高': '高',
-    'high': '高', 'medium': '中', 'normal': '中',
-    'low': '低', '暂缓': '暂缓', 'later': '暂缓',
-  };
-
-  const lower = normalized.toLowerCase();
-  for (const [key, value] of Object.entries(map)) {
-    if (lower.includes(key.toLowerCase()) || normalized.includes(key)) {
-      return value;
-    }
-  }
-
-  return '中';
-}
-
 function dateStringToTimestamp(dateStr: string): number | null {
   const cleaned = dateStr.trim();
   const match = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -1160,14 +1260,14 @@ export async function deleteRecord(recordId: string, config?: WorkspaceConfig): 
   const url = `${API_BASE}/v1.0/notable/bases/${baseId}/sheets/${finalSheetId}/records/delete?operatorId=${encodeURIComponent(operatorId)}`;
   console.log(`[钉钉] 删除记录: ${url}, recordId=${recordId}`);
 
-  const res = await fetch(url, {
+  const res = await dtFetch(url, {
     method: 'POST',
     headers: {
       'x-acs-dingtalk-access-token': token,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ recordIds: [recordId] }),
-  });
+  }, DT_TIMEOUT_WRITE);
 
   if (!res.ok) {
     const errText = await res.text();
@@ -1198,20 +1298,22 @@ export async function updateRecordFields(
     records: [{ id: recordId, fields }],
   };
 
-  // 带重试机制的请求 (处理 503/500 等临时性服务端故障)
-  const MAX_RETRIES = 3;
+  // 带重试机制的请求 (处理 503/500/网络抖动/超时)
+  // 注意: 单次请求 4s 超时 + 0.5s 退避, 总共 2 次尝试, 控制在 Vercel Hobby 10s 预算内
+  const MAX_ATTEMPTS = 2;
+  const ATTEMPT_TIMEOUT = 4000;
   let lastError: Error | null = null;
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await fetch(url, {
+      const res = await dtFetch(url, {
         method: 'PUT',
         headers: {
           'x-acs-dingtalk-access-token': token,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-      });
+      }, ATTEMPT_TIMEOUT);
 
       if (res.ok) {
         console.log(`[钉钉] 轻量更新成功: recordId=${recordId}`);
@@ -1221,30 +1323,28 @@ export async function updateRecordFields(
       // 仅对 503/500 重试, 其他错误直接抛出
       if (res.status === 503 || res.status === 500) {
         const errText = await res.text();
-        console.warn(`[钉钉] 轻量更新失败 (尝试 ${attempt}/${MAX_RETRIES}): HTTP ${res.status} - ${errText}`);
+        console.warn(`[钉钉] 轻量更新失败 (尝试 ${attempt}/${MAX_ATTEMPTS}): HTTP ${res.status} - ${errText}`);
         lastError = new Error(`轻量更新钉钉记录失败: HTTP ${res.status} - ${errText}`);
-
-        if (attempt < MAX_RETRIES) {
-          const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
-          console.log(`[钉钉] ${delay}ms 后重试...`);
-          await new Promise<void>((resolve) => setTimeout(() => resolve(), delay));
-          continue;
-        }
       } else {
         const errText = await res.text();
         console.error('钉钉轻量更新失败:', res.status, errText);
         throw new Error(`轻量更新钉钉记录失败: HTTP ${res.status} - ${errText}`);
       }
     } catch (err) {
-      // 网络错误也重试
-      if (err instanceof TypeError && attempt < MAX_RETRIES) {
-        console.warn(`[钉钉] 网络错误 (尝试 ${attempt}/${MAX_RETRIES}): ${err.message}`);
-        lastError = err;
-        const delay = Math.pow(2, attempt - 1) * 1000;
-        await new Promise<void>((resolve) => setTimeout(() => resolve(), delay));
-        continue;
+      // 网络错误 / 超时: 记录并按重试逻辑处理
+      lastError = err instanceof Error ? err : new Error(String(err));
+      // 业务错误 (上面构造的 Error 且非超时/网络) 直接抛出
+      if (lastError.message.startsWith('轻量更新钉钉记录失败: HTTP') &&
+          !lastError.message.includes('503') && !lastError.message.includes('500')) {
+        throw lastError;
       }
-      throw err;
+      console.warn(`[钉钉] 轻量更新网络/超时错误 (尝试 ${attempt}/${MAX_ATTEMPTS}): ${lastError.message}`);
+    }
+
+    if (attempt < MAX_ATTEMPTS) {
+      const delay = 500; // 0.5s 后重试 (控制总时长)
+      console.log(`[钉钉] ${delay}ms 后重试...`);
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), delay));
     }
   }
 
@@ -1254,7 +1354,7 @@ export async function updateRecordFields(
 // ============== 辅助函数 ==============
 
 /**
- * 检测占位文本: AI 返回的无效内容 (如 "暂无岗位描述", "无", "未知")
+ * 检测占位文本: AI 返回的无效内容 (如 "暂无", "无", "未知")
  * 这些不是真正的业务数据, 应该阻止写入钉钉
  */
 function isPlaceholderValue(value: string | null | undefined): boolean {
